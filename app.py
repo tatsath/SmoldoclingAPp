@@ -289,7 +289,7 @@ with tab2:
             if st.button("Run Query") and prompt:
                 # Only filter by section if a specific section is selected
                 if selected_section and selected_section != "All Sections":
-                    where_filter = {"section": {"eq": selected_section}}
+                    where_filter = {"section": selected_section}
                 else:
                     where_filter = None
                 with st.spinner("Searching for relevant content..."):
