@@ -7,6 +7,7 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import EasyOcrOptions, PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
+import openai
 import uuid
 import os
 import time
@@ -14,9 +15,6 @@ import tempfile
 from dotenv import load_dotenv
 import re
 import shutil
-import boto3
-import json
-from pathlib import Path
 
 # Define sections and sample prompts
 SECTIONS = [
@@ -28,81 +26,25 @@ SECTIONS = [
 # Load environment variables
 load_dotenv()
 
-# ------------------ MODEL CONFIGURATIONS ------------------ #
-TITAN_V2_CONFIG = {
-    "modelId": "amazon.titan-embed-text-v2:0",
-    "contentType": "application/json",
-    "accept": "*/*",
-    "body_template": {
-        "inputText": "",
-        "dimensions": 512,
-        "normalize": True
-    }
-}
-
-CLAUDE_HAIKU_CONFIG = {
-    "modelId": "anthropic.claude-3-haiku-20240307-v1:0",
-    "contentType": "application/json",
-    "accept": "application/json",
-    "body_template": {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1000,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": ""
-                    }
-                ]
-            }
-        ]
-    }
-}
-
 # ------------------ SETTINGS ------------------ #
-# Get AWS Bedrock credentials from environment variable
-aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
-aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-aws_region = os.getenv("AWS_REGION")
+# Get OpenAI API key from environment variable
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    st.error("Please set your OpenAI API key in the .env file")
+    st.info("Create a .env file in the project directory with: OPENAI_API_KEY=your_api_key_here")
+    st.stop()
 
-bedrock = boto3.client(
-    service_name="bedrock-runtime",
-    region_name=aws_region,
-    aws_access_key_id=aws_access_key_id,
-    aws_secret_access_key=aws_secret_access_key,
+openai.api_key = openai_api_key
+
+# Updated to use the latest OpenAI embedding model
+embedding_model = "text-embedding-3-small"  # 1536 dimensions, same as ada-002 but newer
+embed_function = embedding_functions.OpenAIEmbeddingFunction(
+    api_key=openai.api_key, 
+    model_name=embedding_model
 )
 
-# Bedrock Embedding Function for ChromaDB
-class BedrockEmbeddingFunction:
-    def __init__(self, model_id=TITAN_V2_CONFIG["modelId"]):
-        self.model_id = model_id
-        self.dim = TITAN_V2_CONFIG["body_template"]["dimensions"]
-    def __call__(self, input):
-        if isinstance(input, str):
-            input = [input]
-        embeddings = []
-        for text in input:
-            body = TITAN_V2_CONFIG["body_template"].copy()
-            body["inputText"] = text
-            response = bedrock.invoke_model(
-                modelId=self.model_id,
-                body=json.dumps(body),
-                accept=TITAN_V2_CONFIG["accept"],
-                contentType=TITAN_V2_CONFIG["contentType"]
-            )
-            result = json.loads(response['body'].read())
-            embeddings.append(result['embedding'])
-        return embeddings
-    def name(self):
-        return self.model_id
-
-embed_function = BedrockEmbeddingFunction()
-
 # Initialize ChromaDB client with new configuration
-CHROMA_DB_PATH = "./chroma_titan_v2"  # Changed to reflect the model being used
-client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+client = chromadb.PersistentClient(path="./chroma_ada")
 
 artifacts_path = "/Users/tatsa/.cache/docling/models"
 pipeline_options = PdfPipelineOptions(artifacts_path=artifacts_path)
@@ -111,20 +53,6 @@ doc_converter = DocumentConverter(
         InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
     }
 )
-
-# Bedrock Chat Completion
-def bedrock_chat(prompt, model_id=CLAUDE_HAIKU_CONFIG["modelId"]):
-    body = CLAUDE_HAIKU_CONFIG["body_template"].copy()
-    body["messages"][0]["content"][0]["text"] = prompt
-    
-    response = bedrock.invoke_model(
-        modelId=model_id,
-        body=json.dumps(body),
-        accept=CLAUDE_HAIKU_CONFIG["accept"],
-        contentType=CLAUDE_HAIKU_CONFIG["contentType"]
-    )
-    result = json.loads(response['body'].read())
-    return result['content'][0]['text']
 
 # ------------------ UTILS ------------------ #
 def chunk_text(text, chunk_size=2000, overlap=200):
@@ -232,8 +160,8 @@ st.sidebar.subheader("ChromaDB Management")
 
 # Button to clear ChromaDB data directory
 def clear_chromadb():
-    if os.path.exists(CHROMA_DB_PATH):
-        shutil.rmtree(CHROMA_DB_PATH)
+    if os.path.exists("./chroma_ada"):
+        shutil.rmtree("./chroma_ada")
         st.sidebar.success("ChromaDB data directory cleared. Please restart the app.")
     else:
         st.sidebar.info("ChromaDB data directory does not exist.")
@@ -257,9 +185,8 @@ if existing_collections:
 
 # Show current embedding model info
 st.sidebar.subheader("Current Settings")
-st.sidebar.write(f"**Embedding Model:** {embed_function.model_id}")
-st.sidebar.write(f"**Dimensions:** {embed_function.dim}")
-st.sidebar.write(f"**ChromaDB Path:** {CHROMA_DB_PATH}")
+st.sidebar.write(f"**Embedding Model:** {embedding_model}")
+st.sidebar.write("**Dimensions:** 1536")
 
 # Main content area
 tab1, tab2, tab3 = st.tabs(["Process Documents", "Query Documents", "Debug Info"])
@@ -274,21 +201,12 @@ with tab1:
     if enable_section_mapping and uploaded_files:
         st.subheader("Map Sections to Documents")
         doc_names = [f.name for f in uploaded_files]
-        # Add "All Files" option at the beginning
-        all_files_option = "All Files"
-        doc_names_with_all = [all_files_option] + doc_names
-        
         for section in SECTIONS:
             selected_docs = st.multiselect(
                 f"Select documents for section: {section['name']}",
-                doc_names_with_all,
+                doc_names,
                 key=f"map_{section['name']}"
             )
-            
-            # If "All Files" is selected, use all document names
-            if all_files_option in selected_docs:
-                selected_docs = doc_names
-            
             section_to_docs[section["name"]] = selected_docs
             for doc in selected_docs:
                 doc_to_sections.setdefault(doc, []).append(section["name"])
@@ -380,38 +298,24 @@ with tab2:
                             name=selected_collection,
                             embedding_function=embed_function
                         )
-                        # Use query_texts for semantic search
                         results = collection.query(
                             query_texts=[prompt],
                             n_results=5,
-                            where=where_filter,
-                            include=["documents", "metadatas", "distances"]
+                            where=where_filter
                         )
-                        
-                        # Display the results
-                        st.write("### Search Results")
-                        for i, (doc, metadata, distance) in enumerate(zip(results["documents"][0], results["metadatas"][0], results["distances"][0])):
-                            st.write(f"**Result {i+1}** (Similarity: {1 - distance:.2f})")
-                            st.write(f"Source: {metadata['filename']}")
-                            st.write(f"Section: {metadata['section']}")
-                            st.write(f"Content: {doc[:200]}...")
-                            st.write("---")
-                        
-                        # Combine all relevant content for the final response
-                        context = "\n\n".join(results["documents"][0])
-                        
+                        context = "\n".join(results["documents"][0])
                         with st.spinner("Generating response..."):
-                            # Create a more detailed prompt for Claude
-                            enhanced_prompt = f"""Based on the following context, please answer the question: {prompt}
-
-Context:
-{context}
-
-Please provide a comprehensive answer based on the context above."""
-                            
-                            response = bedrock_chat(enhanced_prompt)
+                            from openai import OpenAI
+                            client_openai = OpenAI(api_key=openai_api_key)
+                            response = client_openai.chat.completions.create(
+                                model="gpt-4",
+                                messages=[
+                                    {"role": "system", "content": "You are a helpful assistant generating reports from document context."},
+                                    {"role": "user", "content": f"Use this info to generate a report:\n{context}\n\nQuery: {prompt}"}
+                                ]
+                            )
                             st.write("### Generated Report")
-                            st.write(response)
+                            st.write(response.choices[0].message.content)
                     except Exception as e:
                         st.error(f"Query failed: {str(e)}")
                         st.error("This might be due to embedding dimension mismatch. Try deleting and recreating the collection.")
@@ -421,8 +325,9 @@ Please provide a comprehensive answer based on the context above."""
 with tab3:
     st.header("Debug Information")
     st.subheader("Current Configuration")
-    st.write(f"**Embedding Model:** {embed_function.model_id}")
-    st.write(f"**ChromaDB Path:** {CHROMA_DB_PATH}")
+    st.write(f"**Embedding Model:** {embedding_model}")
+    st.write(f"**ChromaDB Path:** ./chroma_ada")
+    st.write(f"**OpenAI API Key Set:** {'Yes' if openai_api_key else 'No'}")
     
     st.subheader("Collection Details")
     existing_collections = get_all_collections()
