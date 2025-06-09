@@ -221,45 +221,21 @@ def get_collection_info(collection_name):
         return {"model": "Error", "exists": False, "error": str(e)}
 
 # ------------------ UI ------------------ #
-st.title("Document Processing and Querying System")
+st.title("Memo Generation")
 
-# Sidebar for collection management
-st.sidebar.header("Collection Management")
-collection_name = st.sidebar.text_input("Enter collection name")
+# Sidebar: Company name input and list of companies
 
-# Enhanced collection management
-st.sidebar.subheader("ChromaDB Management")
+st.sidebar.header("Data Store")
 
-# Button to clear ChromaDB data directory
-def clear_chromadb():
-    if os.path.exists(CHROMA_DB_PATH):
-        shutil.rmtree(CHROMA_DB_PATH)
-        st.sidebar.success("ChromaDB data directory cleared. Please restart the app.")
-    else:
-        st.sidebar.info("ChromaDB data directory does not exist.")
+company_name = st.sidebar.text_input("Enter Company Name")
 
-if st.sidebar.button("Clear All ChromaDB Data"):
-    clear_chromadb()
-
-existing_collections = get_all_collections()
-if existing_collections:
-    st.sidebar.subheader("Existing Collections")
-    for coll in existing_collections:
-        col_info = get_collection_info(coll.name)
-        st.sidebar.write(f"**{coll.name}**")
-        st.sidebar.write(f"  Model: {col_info.get('model', 'Unknown')}")
-        
-        # Add delete button for each collection
-        if st.sidebar.button(f"Delete {coll.name}", key=f"delete_{coll.name}"):
-            if delete_collection(coll.name):
-                st.sidebar.success(f"Collection '{coll.name}' deleted!")
-                st.rerun()
-
-# Show current embedding model info
-st.sidebar.subheader("Current Settings")
-st.sidebar.write(f"**Embedding Model:** {embed_function.model_id}")
-st.sidebar.write(f"**Dimensions:** {embed_function.dim}")
-st.sidebar.write(f"**ChromaDB Path:** {CHROMA_DB_PATH}")
+st.sidebar.header("Existing Companies")
+existing_companies = get_all_collections()
+if existing_companies:
+    for comp in existing_companies:
+        st.sidebar.write(f"- {comp.name}")
+else:
+    st.sidebar.info("No companies found.")
 
 # Main content area
 tab1, tab2, tab3 = st.tabs(["Process Documents", "Query Documents", "Debug Info"])
@@ -297,19 +273,19 @@ with tab1:
         for f in uploaded_files:
             doc_to_sections[f.name] = ["Unmapped"]
 
-    if uploaded_files and collection_name:
+    if uploaded_files and company_name:
         # Check if collection already exists and warn about embedding compatibility
         existing_collections = get_all_collections()
-        collection_exists = any(coll.name == collection_name for coll in existing_collections)
+        collection_exists = any(coll.name == company_name for coll in existing_collections)
         
         if collection_exists:
-            col_info = get_collection_info(collection_name)
-            st.warning(f"Collection '{collection_name}' already exists with model: {col_info.get('model', 'Unknown')}")
+            col_info = get_collection_info(company_name)
+            st.warning(f"Collection '{company_name}' already exists with model: {col_info.get('model', 'Unknown')}")
             st.info("Documents will be added to the existing collection. Make sure the embedding model matches!")
         
         if st.button("Process and Store Documents"):
             collection = client.get_or_create_collection(
-                name=collection_name, 
+                name=company_name, 
                 embedding_function=embed_function
             )
             all_chunks = []
@@ -351,7 +327,7 @@ with tab1:
                 status_text.empty()  # Clear after each file
             progress_bar.empty()
             status_text.empty()
-            st.success(f"Stored {len(all_chunks)} chunks from {len(uploaded_files)} documents in: {collection_name}")
+            st.success(f"Stored {len(all_chunks)} chunks from {len(uploaded_files)} documents in: {company_name}")
             st.info("All files processed!")
 
 with tab2:
