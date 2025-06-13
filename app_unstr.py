@@ -185,34 +185,25 @@ def parse_markdown_sections(markdown_text):
 def process_file_with_unstructured(uploaded_file):
     # Save uploaded file to temp
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as temp_file:
-        # Reset file pointer to beginning
         uploaded_file.seek(0)
-        # Read the entire content
         file_content = uploaded_file.read()
         if not file_content:
             raise ValueError(f"Uploaded file {uploaded_file.name} has no content")
-        
-        # Write content to temp file
         temp_file.write(file_content)
         temp_path = temp_file.name
 
     try:
-        # Verify file exists and is readable
         if not os.path.exists(temp_path):
             raise FileNotFoundError(f"Temporary file {temp_path} was not created")
-        
-        # Check file size
         file_size = os.path.getsize(temp_path)
         if file_size == 0:
             raise ValueError(f"File is empty (size: {file_size} bytes)")
-        
-        # Try to read first few bytes to check if it's a valid PDF
         with open(temp_path, 'rb') as f:
             header = f.read(5)
             if not header.startswith(b'%PDF-'):
                 raise ValueError("File does not appear to be a valid PDF (missing PDF header)")
 
-        # Use Unstructured to partition PDF with more detailed error handling
+        # Defensive: check all required params
         try:
             chunks = partition_pdf(
                 filename=temp_path,
@@ -225,6 +216,14 @@ def process_file_with_unstructured(uploaded_file):
                 combine_text_under_n_chars=2000,
                 new_after_n_chars=6000,
             )
+            if chunks is None:
+                raise ValueError(
+                    "This PDF could not be processed (partition_pdf returned None). "
+                    "It may be corrupted, encrypted, or unsupported. "
+                    "Try opening and re-saving the PDF, or use a different file."
+                )
+            if not hasattr(chunks, '__len__'):
+                raise ValueError("partition_pdf did not return a list-like object")
         except Exception as e:
             raise ValueError(f"PDF processing failed: {str(e)}")
 
@@ -235,11 +234,13 @@ def process_file_with_unstructured(uploaded_file):
         tables = []
         texts = []
         images = []
+        
         for chunk in chunks:
             if "Table" in str(type(chunk)):
                 tables.append({
                     'content': chunk.text,
-                    'page_number': getattr(chunk.metadata, 'page_number', 1)
+                    'page_number': getattr(chunk.metadata, 'page_number', 1),
+                    'html': getattr(chunk.metadata, 'text_as_html', '')
                 })
             if "CompositeElement" in str(type(chunk)):
                 texts.append({
@@ -250,7 +251,11 @@ def process_file_with_unstructured(uploaded_file):
                 if hasattr(chunk, 'metadata') and hasattr(chunk.metadata, 'orig_elements'):
                     for el in chunk.metadata.orig_elements:
                         if "Image" in str(type(el)) and hasattr(el.metadata, 'image_base64'):
-                            images.append(el.metadata.image_base64)
+                            images.append({
+                                'base64': el.metadata.image_base64,
+                                'page_number': getattr(chunk.metadata, 'page_number', 1)
+                            })
+        
         return texts, tables, images
     except Exception as e:
         raise ValueError(f"Failed to process {uploaded_file.name}: {str(e)}")
@@ -259,6 +264,81 @@ def process_file_with_unstructured(uploaded_file):
             os.unlink(temp_path)
         except:
             pass  # Ignore cleanup errors
+
+def summarize_text_with_bedrock(text_content):
+    """Summarize text using AWS Bedrock"""
+    prompt = f"""You are an assistant tasked with summarizing text.
+Give a concise summary of the text.
+
+Respond only with the summary, no additional comment.
+Do not start your message by saying "Here is a summary" or anything like that.
+Just give the summary as it is.
+
+Text chunk: {text_content}"""
+    
+    body = CLAUDE_HAIKU_CONFIG["body_template"].copy()
+    body["messages"][0]["content"][0]["text"] = prompt
+    
+    response = bedrock.invoke_model(
+        modelId=CLAUDE_HAIKU_CONFIG["modelId"],
+        body=json.dumps(body),
+        accept=CLAUDE_HAIKU_CONFIG["accept"],
+        contentType=CLAUDE_HAIKU_CONFIG["contentType"]
+    )
+    result = json.loads(response['body'].read())
+    return result['content'][0]['text']
+
+def summarize_table_with_bedrock(table_html):
+    """Summarize table using AWS Bedrock"""
+    prompt = f"""You are an assistant tasked with summarizing tables.
+Give a concise summary of the table.
+
+Respond only with the summary, no additional comment.
+Do not start your message by saying "Here is a summary" or anything like that.
+Just give the summary as it is.
+
+Table HTML: {table_html}"""
+    
+    body = CLAUDE_HAIKU_CONFIG["body_template"].copy()
+    body["messages"][0]["content"][0]["text"] = prompt
+    
+    response = bedrock.invoke_model(
+        modelId=CLAUDE_HAIKU_CONFIG["modelId"],
+        body=json.dumps(body),
+        accept=CLAUDE_HAIKU_CONFIG["accept"],
+        contentType=CLAUDE_HAIKU_CONFIG["contentType"]
+    )
+    result = json.loads(response['body'].read())
+    return result['content'][0]['text']
+
+def summarize_image_with_bedrock(image_base64):
+    """Summarize image using AWS Bedrock"""
+    prompt = f"""Describe the image in detail. Be specific about any graphs, charts, or visual elements."""
+    
+    body = CLAUDE_HAIKU_CONFIG["body_template"].copy()
+    body["messages"][0]["content"] = [
+        {
+            "type": "text",
+            "text": prompt
+        },
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": image_base64
+            }
+        }
+    ]
+    
+    response = bedrock.invoke_model(
+        modelId=CLAUDE_HAIKU_CONFIG["modelId"],
+        body=json.dumps(body),
+        accept=CLAUDE_HAIKU_CONFIG["accept"],
+        contentType=CLAUDE_HAIKU_CONFIG["contentType"]
+    )
+    result = json.loads(response['body'].read())
+    return result['content'][0]['text']
 
 def get_all_collections():
     return client.list_collections()
@@ -368,98 +448,161 @@ with tab1:
 
     # Extraction preview UI
     if nonempty_files:
+        # Only one beautiful blue button above the preview header, using Streamlit only
+        st.markdown("""
+            <style>
+            .stButton > button {
+                background-color: #1976d2;
+                color: white;
+                font-weight: bold;
+                border-radius: 8px;
+                padding: 0.8em 2.5em;
+                font-size: 1.2em;
+                box-shadow: 0 2px 8px rgba(25, 118, 210, 0.15);
+                border: none;
+                transition: background 0.2s, box-shadow 0.2s;
+                margin-bottom: 1.5em;
+            }
+            .stButton > button:hover {
+                background-color: #1251a3;
+                box-shadow: 0 4px 16px rgba(25, 118, 210, 0.25);
+            }
+            </style>
+        """, unsafe_allow_html=True)
+        process_clicked = st.button("Process and Store Documents")
         st.subheader("Extraction Preview")
-        for uploaded_file in nonempty_files:
-            st.markdown(f"**File:** {uploaded_file.name}")
-            try:
-                texts, tables, images = process_file_with_unstructured(uploaded_file)
-                for el in texts:
-                    st.write(f"Type: text | Page: {el['page_number']}")
-                    st.code(el['content'][:500])
-                for table in tables:
-                    st.write(f"Type: table | Page: {table['page_number']}")
-                    st.code(table['content'][:500])
-            except Exception as e:
-                st.error(f"❌ {str(e)}")
-
-    if nonempty_files and company_name:
-        existing_collections = get_all_collections()
-        collection_exists = any(coll.name == company_name for coll in existing_collections)
-        if collection_exists:
-            col_info = get_collection_info(company_name)
-            st.warning(f"Collection '{company_name}' already exists with model: {col_info.get('model', 'Unknown')}")
-            st.info("Documents will be added to the existing collection. Make sure the embedding model matches!")
-        if st.button("Process and Store Documents"):
+        if process_clicked:
+            # Check for existing collection and show info
+            existing_collections = get_all_collections()
+            collection_exists = any(coll.name == company_name for coll in existing_collections)
+            if collection_exists:
+                col_info = get_collection_info(company_name)
+                st.warning(f"Collection '{company_name}' already exists with model: {col_info.get('model', 'Unknown')}")
+                st.info("Documents will be added to the existing collection. Make sure the embedding model matches!")
             collection = client.get_or_create_collection(
                 name=company_name, 
                 embedding_function=embed_function
             )
             all_chunks = []
             total_files = len(nonempty_files)
-            progress_bar = st.progress(0)
+            preview_progress = st.progress(0, text="Starting extraction and storage...")
             status_text = st.empty()
-            embedded_docs = {}
             success_files = []
             failed_files = []
+            doc_chunks_map = {}  # Store chunks for each doc for display
             for idx, uploaded_file in enumerate(nonempty_files):
-                doc_sections = doc_to_sections.get(uploaded_file.name, ["Unmapped"])
                 status_text.text(f"Processing file {idx + 1} of {total_files}: {uploaded_file.name}")
-                with st.spinner(f"Processing {uploaded_file.name}..."):
-                    start_time = time.time()
-                    try:
-                        texts, tables, images = process_file_with_unstructured(uploaded_file)
-                        success_files.append(uploaded_file.name)
-                    except Exception as e:
-                        st.error(f"❌ {str(e)}")
-                        failed_files.append(uploaded_file.name)
-                        continue
-                    processing_time = time.time() - start_time
-                    st.info(f"Processed {uploaded_file.name} in {processing_time:.2f} seconds")
-                    
-                    # Process and store text chunks
+                try:
+                    texts, tables, images = process_file_with_unstructured(uploaded_file)
+                    doc_chunks_map[uploaded_file.name] = {'texts': [], 'tables': [], 'images': []}
                     doc_sections = doc_to_sections.get(uploaded_file.name, ["Unmapped"])
-                    chunk_progress = st.progress(0, text=f"Embedding chunks for {uploaded_file.name}")
-                    
-                    # Combine all text content
-                    all_text_content = []
+                    # Process text chunks
                     for text_chunk in texts:
                         if isinstance(text_chunk, dict) and 'content' in text_chunk:
                             content = text_chunk['content'].strip()
                             if content:
-                                all_text_content.append(content)
-                    
-                    # Add tables content
+                                summary = summarize_text_with_bedrock(content)
+                                chunk_id = f"text_{uuid.uuid4().hex[:6]}"
+                                collection.add(
+                                    documents=[summary],
+                                    metadatas=[{
+                                        "filename": uploaded_file.name,
+                                        "section": doc_sections[0],
+                                        "type": "text",
+                                        "page": text_chunk['page_number']
+                                    }],
+                                    ids=[chunk_id]
+                                )
+                                doc_chunks_map[uploaded_file.name]['texts'].append({
+                                    'page_number': text_chunk['page_number'],
+                                    'content': content,
+                                    'summary': summary
+                                })
+                                all_chunks.append(summary)
+                    # Process table chunks
                     for table in tables:
-                        if isinstance(table, dict) and 'content' in table:
-                            content = table['content'].strip()
-                            if content:
-                                all_text_content.append(content)
-                    
-                    # Store chunks in ChromaDB
-                    total_chunks = len(all_text_content)
-                    for i, text_content in enumerate(all_text_content):
-                        for section in doc_sections:
-                            chunk_id = f"chunk_{i}_{uuid.uuid4().hex[:6]}"
+                        if isinstance(table, dict) and 'html' in table:
+                            summary = summarize_table_with_bedrock(table['html'])
+                            chunk_id = f"table_{uuid.uuid4().hex[:6]}"
                             collection.add(
-                                documents=[text_content],
-                                metadatas=[{"filename": uploaded_file.name, "section": section}],
+                                documents=[summary],
+                                metadatas=[{
+                                    "filename": uploaded_file.name,
+                                    "section": doc_sections[0],
+                                    "type": "table",
+                                    "page": table['page_number']
+                                }],
                                 ids=[chunk_id]
                             )
-                            all_chunks.append(text_content)
-                        chunk_progress.progress((i + 1) / total_chunks, text=f"Embedded chunk {i+1}/{total_chunks} for {uploaded_file.name}")
-                    
-                    chunk_progress.empty()
-                progress_bar.progress((idx + 1) / total_files)
-                status_text.empty()  # Clear after each file
-            progress_bar.empty()
-            status_text.empty()
-            st.success(f"Stored {len(all_chunks)} chunks from {len(nonempty_files)} documents in: {company_name}")
-            st.info("All files processed!")
-            # Show summary of successes and failures
-            if success_files:
-                st.success(f"Successfully processed: {', '.join(success_files)}")
-            if failed_files:
-                st.error(f"Failed to process: {', '.join(failed_files)}")
+                            doc_chunks_map[uploaded_file.name]['tables'].append({
+                                'page_number': table['page_number'],
+                                'content': table['content'],
+                                'html': table['html'],
+                                'summary': summary
+                            })
+                            all_chunks.append(summary)
+                    # Process image chunks
+                    for image in images:
+                        if isinstance(image, dict) and 'base64' in image:
+                            summary = summarize_image_with_bedrock(image['base64'])
+                            chunk_id = f"image_{uuid.uuid4().hex[:6]}"
+                            collection.add(
+                                documents=[summary],
+                                metadatas=[{
+                                    "filename": uploaded_file.name,
+                                    "section": doc_sections[0],
+                                    "type": "image",
+                                    "page": image['page_number']
+                                }],
+                                ids=[chunk_id]
+                            )
+                            doc_chunks_map[uploaded_file.name]['images'].append({
+                                'page_number': image['page_number'],
+                                'base64': image['base64'],
+                                'summary': summary
+                            })
+                            all_chunks.append(summary)
+                    success_files.append(uploaded_file.name)
+                except Exception as e:
+                    st.error(f"❌ {str(e)}")
+                    failed_files.append(uploaded_file.name)
+                    continue
+                preview_progress.progress((idx + 1) / total_files, text=f"Finished extracting: {uploaded_file.name}")
+                status_text.empty()
+            preview_progress.empty()
+            st.success("Task completed!")
+            # Show all chunks in collapsible sections (no nested expanders)
+            for doc_name, chunk_dict in doc_chunks_map.items():
+                with st.expander(f"File: {doc_name}", expanded=False):
+                    # Text chunks
+                    if chunk_dict['texts']:
+                        st.markdown("**Text Chunks**")
+                        for el in chunk_dict['texts']:
+                            st.write(f"Type: text | Page: {el['page_number']}")
+                            st.code(el['content'][:500])
+                            st.markdown(f"<span style='color:#1976d2;font-weight:bold;'>Text Summary:</span> {el['summary']}", unsafe_allow_html=True)
+                    # Table chunks
+                    if chunk_dict['tables']:
+                        st.markdown("**Table Chunks**")
+                        for table in chunk_dict['tables']:
+                            st.write(f"Type: table | Page: {table['page_number']}")
+                            if 'html' in table and table['html']:
+                                st.markdown(f"<div style='overflow-x:auto'>{table['html']}</div>", unsafe_allow_html=True)
+                            else:
+                                st.code(table['content'][:500])
+                            st.markdown(f"<span style='color:#1976d2;font-weight:bold;'>Table Summary:</span> {table['summary']}", unsafe_allow_html=True)
+                    # Image chunks
+                    if chunk_dict['images']:
+                        st.markdown("**Image Chunks**")
+                        for image in chunk_dict['images']:
+                            st.write(f"Type: image | Page: {image['page_number']}")
+                            if 'base64' in image:
+                                try:
+                                    img_bytes = base64.b64decode(image['base64'])
+                                    st.image(img_bytes, caption=f"Image on page {image['page_number']}", use_container_width=True)
+                                except Exception as e:
+                                    st.error(f"Error displaying image: {e}")
+                            st.markdown(f"<span style='color:#1976d2;font-weight:bold;'>Image Summary:</span> {image['summary']}", unsafe_allow_html=True)
 
 with tab2:
     st.header("ECC Memo Generation")
