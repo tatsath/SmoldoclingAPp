@@ -27,6 +27,10 @@ import base64
 # Add langchain_aws imports
 from langchain_aws import BedrockEmbeddings
 
+# Add robust extraction for DOCX and PPTX
+from unstructured.partition.docx import partition_docx
+from unstructured.partition.pptx import partition_pptx
+
 # Set wide layout
 st.set_page_config(layout="wide")
 # Restore previous blue panel (Kulla, not fixed, margin below)
@@ -206,13 +210,8 @@ def process_file_with_unstructured(uploaded_file):
         file_size = os.path.getsize(temp_path)
         if file_size == 0:
             raise ValueError(f"File is empty (size: {file_size} bytes)")
-        with open(temp_path, 'rb') as f:
-            header = f.read(5)
-            if not header.startswith(b'%PDF-'):
-                raise ValueError("File does not appear to be a valid PDF (missing PDF header)")
-
-        # Partition PDF with robust parameters
-        try:
+        ext = os.path.splitext(temp_path)[1].lower()
+        if ext == ".pdf":
             elements = partition_pdf(
                 filename=temp_path,
                 extract_images_in_pdf=True,
@@ -220,28 +219,39 @@ def process_file_with_unstructured(uploaded_file):
                 strategy="hi_res",
                 hi_res_model_name="yolox",
                 chunking_strategy="by_title",
-                # extract_image_block_types=["Image"],   
-                extract_image_block_to_payload=True,  
+                extract_image_block_to_payload=True,
                 max_characters=4000,
                 new_after_n_chars=3800,
                 combine_text_under_n_chars=2000,
                 image_output_dir_path='imgs',
             )
-            if elements is None:
-                raise ValueError(
-                    "This PDF could not be processed (partition_pdf returned None). "
-                    "It may be corrupted, encrypted, or unsupported. "
-                    "Try opening and re-saving the PDF, or use a different file."
-                )
-            if not hasattr(elements, '__len__'):
-                raise ValueError("partition_pdf did not return a list-like object")
-        except Exception as e:
-            raise ValueError(f"PDF processing failed: {str(e)}")
-
-        if not elements:
-            raise ValueError("No content could be extracted from the PDF")
-
-        # Extract tables, texts, and images robustly
+        elif ext in [".doc", ".docx"]:
+            elements = partition_docx(
+                filename=temp_path,
+                extract_images_in_docx=True,
+                extract_image_block_to_payload=True,
+                image_output_dir_path='imgs',
+            )
+        elif ext in [".ppt", ".pptx"]:
+            elements = partition_pptx(
+                filename=temp_path,
+                extract_images_in_pptx=True,
+                extract_image_block_to_payload=True,
+                image_output_dir_path='imgs',
+            )
+        elif ext == ".txt":
+            with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
+                text = f.read()
+            elements = [text]
+        else:
+            raise ValueError(f"Unsupported file type: {ext}")
+        if elements is None:
+            raise ValueError(
+                f"This file could not be processed (partition returned None). It may be corrupted, encrypted, or unsupported. Try opening and re-saving the file, or use a different file."
+            )
+        if not hasattr(elements, '__len__'):
+            raise ValueError("partition did not return a list-like object")
+        # Extract tables, texts, and images robustly (same as before)
         tables = []
         texts = []
         images = []
@@ -283,6 +293,9 @@ def process_file_with_unstructured(uploaded_file):
                                     'page_number': getattr(el.metadata, 'page_number', 1),
                                     'html': getattr(el.metadata, 'text_as_html', '')
                                 })
+                elif isinstance(chunk, str):
+                    # For TXT files
+                    texts.append({'content': chunk, 'page_number': 1})
             except Exception as e:
                 print(f"Error processing chunk: {e}")
                 continue
@@ -437,8 +450,8 @@ with tab1:
         # Prompt user for data store name
         data_store_name = st.text_input("Enter a data store name")
         uploaded_files = st.file_uploader(
-            "Upload multiple documents (PDF/TXT/IMP)",
-            type=['pdf', 'txt', 'imp'],
+            "Upload multiple documents (PDF/TXT/DOC/DOCX/PPT/PPTX)",
+            type=['pdf', 'txt', 'doc', 'docx', 'ppt', 'pptx'],
             accept_multiple_files=True,
             key="file_uploader"
         )
@@ -553,10 +566,10 @@ with tab1:
                     if isinstance(text_chunk, dict) and 'content' in text_chunk:
                         content = text_chunk['content'].strip()
                         if content:
-                            summary = summarize_text_with_bedrock(content)
+                            # summary = summarize_text_with_bedrock(content)
                             chunk_id = f"text_{uuid.uuid4().hex[:6]}"
                             collection.add(
-                                documents=[summary],
+                                documents=[content],
                                 metadatas=[{
                                     "filename": uploaded_file.name,
                                     "section": doc_sections[0],
@@ -568,9 +581,9 @@ with tab1:
                             doc_chunks_map[uploaded_file.name]['texts'].append({
                                 'page_number': text_chunk['page_number'],
                                 'content': content,
-                                'summary': summary
+                                # 'summary': summary
                             })
-                            all_chunks.append(summary)
+                            all_chunks.append(content)
                 # Process table chunks
                 for table in tables:
                     if isinstance(table, dict) and 'html' in table:
@@ -636,7 +649,7 @@ with tab1:
                     for el in chunk_dict['texts']:
                         st.write(f"Type: text | Page: {el['page_number']}")
                         st.code(el['content'][:500])
-                        st.markdown(f"<span style='color:#1976d2;font-weight:bold;'>Text Summary:</span> {el['summary']}", unsafe_allow_html=True)
+                        # st.markdown(f"<span style='color:#1976d2;font-weight:bold;'>Text Summary:</span> {el['summary']}", unsafe_allow_html=True)
             # Table chunks
             if chunk_dict['tables']:
                 with st.expander("Table Chunks", expanded=False):
@@ -662,10 +675,18 @@ with tab1:
 
 with tab2:
     st.header("ECC Memo Generation")
-    # Use the generated data_store_name by default
-    if data_store_name:
-        col_info = get_collection_info(data_store_name)
-        st.info(f"Collection: {data_store_name} | Model: {col_info.get('model', 'Unknown')}")
+    # Always show the collection dropdown, sorted by most recent (if possible)
+    existing_collections = get_all_collections()
+    # Try to sort by creation or update time if available, else by name descending
+    try:
+        collection_names = [coll.name for coll in existing_collections[::-1]]
+    except Exception:
+        collection_names = [coll.name for coll in sorted(existing_collections, key=lambda c: c.name, reverse=True)]
+    selected_collection = st.selectbox("Select Collection", collection_names) if collection_names else st.selectbox("Select Collection", [])
+
+    if selected_collection:
+        col_info = get_collection_info(selected_collection)
+        st.info(f"Collection: {selected_collection} | Model: {col_info.get('model', 'Unknown')}")
         # Section dropdown and prompt
         section_names = [s["name"] for s in SECTIONS]
         selected_section = st.selectbox("Select Section (optional)", ["All Sections"] + section_names)
@@ -680,7 +701,7 @@ with tab2:
             with st.spinner("Searching for relevant content..."):
                 try:
                     collection = client.get_collection(
-                        name=data_store_name,
+                        name=selected_collection,
                         embedding_function=chroma_embedding_function
                     )
                     # Use query_texts for semantic search
@@ -690,18 +711,9 @@ with tab2:
                         where=where_filter,
                         include=["documents", "metadatas", "distances"]
                     )
-                    # Display the results
-                    st.write("### Search Results")
-                    for i, (doc, metadata, distance) in enumerate(zip(results["documents"][0], results["metadatas"][0], results["distances"][0])):
-                        st.write(f"**Result {i+1}** (Similarity: {1 - distance:.2f})")
-                        st.write(f"Source: {metadata['filename']}")
-                        st.write(f"Section: {metadata['section']}")
-                        st.write(f"Content: {doc[:200]}...")
-                        st.write("---")
-                    # Combine all relevant content for the final response
+                    # Display the final result at the top
                     context = "\n\n".join(results["documents"][0])
                     with st.spinner("Generating response..."):
-                        # Create a more detailed prompt for Claude
                         enhanced_prompt = f"""Based on the following context, please answer the question: {prompt}
 
 Context:
@@ -709,13 +721,21 @@ Context:
 
 Please provide a comprehensive answer based on the context above."""
                         response = bedrock_chat(enhanced_prompt)
-                        st.write("### Generated Report")
+                        st.markdown("### Final Generated Report")
                         st.write(response)
+                    # Collapsible chunks for each result
+                    st.markdown("---")
+                    st.markdown("### Relevant Chunks")
+                    for i, (doc, metadata, distance) in enumerate(zip(results["documents"][0], results["metadatas"][0], results["distances"][0])):
+                        with st.expander(f"Chunk {i+1} | Type: {metadata.get('type', 'text')} | Section: {metadata.get('section', '')} | Similarity: {1 - distance:.2f}"):
+                            st.write(f"**Source:** {metadata['filename']}")
+                            st.write(f"**Section:** {metadata['section']}")
+                            st.write(f"**Content:** {doc[:2000]}...")
+                            if metadata.get('type') == 'table' and 'html' in metadata:
+                                st.markdown(f"<div style='overflow-x:auto'>{metadata['html']}</div>", unsafe_allow_html=True)
                 except Exception as e:
                     st.error(f"Query failed: {str(e)}")
                     st.error("This might be due to embedding dimension mismatch. Try deleting and recreating the collection.")
-    else:
-        st.info("No data store available. Please process some documents first.")
 
 with tab3:
     st.header("Validation")
