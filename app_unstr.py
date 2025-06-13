@@ -21,6 +21,7 @@ import pandas as pd
 
 # Add Unstructured imports
 from unstructured.partition.pdf import partition_pdf
+from unstructured.documents.elements import CompositeElement, NarrativeText, Image, Table
 import base64
 
 # Set wide layout
@@ -203,59 +204,85 @@ def process_file_with_unstructured(uploaded_file):
             if not header.startswith(b'%PDF-'):
                 raise ValueError("File does not appear to be a valid PDF (missing PDF header)")
 
-        # Defensive: check all required params
+        # Partition PDF with robust parameters
         try:
-            chunks = partition_pdf(
+            elements = partition_pdf(
                 filename=temp_path,
+                extract_images_in_pdf=False,
                 infer_table_structure=True,
                 strategy="hi_res",
-                extract_image_block_types=["Image"],
-                extract_image_block_to_payload=True,
+                hi_res_model_name="yolox",
                 chunking_strategy="by_title",
-                max_characters=10000,
+                max_characters=4000,
+                new_after_n_chars=3800,
                 combine_text_under_n_chars=2000,
-                new_after_n_chars=6000,
+                image_output_dir_path='imgs',
             )
-            if chunks is None:
+            if elements is None:
                 raise ValueError(
                     "This PDF could not be processed (partition_pdf returned None). "
                     "It may be corrupted, encrypted, or unsupported. "
                     "Try opening and re-saving the PDF, or use a different file."
                 )
-            if not hasattr(chunks, '__len__'):
+            if not hasattr(elements, '__len__'):
                 raise ValueError("partition_pdf did not return a list-like object")
         except Exception as e:
             raise ValueError(f"PDF processing failed: {str(e)}")
 
-        if not chunks:
+        if not elements:
             raise ValueError("No content could be extracted from the PDF")
 
-        # Separate tables, texts, and images
+        # Extract tables, texts, and images robustly
         tables = []
         texts = []
         images = []
-        
-        for chunk in chunks:
-            if "Table" in str(type(chunk)):
-                tables.append({
-                    'content': chunk.text,
-                    'page_number': getattr(chunk.metadata, 'page_number', 1),
-                    'html': getattr(chunk.metadata, 'text_as_html', '')
-                })
-            if "CompositeElement" in str(type(chunk)):
-                texts.append({
-                    'content': chunk.text,
-                    'page_number': getattr(chunk.metadata, 'page_number', 1)
-                })
-                # Extract images from CompositeElement
-                if hasattr(chunk, 'metadata') and hasattr(chunk.metadata, 'orig_elements'):
-                    for el in chunk.metadata.orig_elements:
-                        if "Image" in str(type(el)) and hasattr(el.metadata, 'image_base64'):
-                            images.append({
-                                'base64': el.metadata.image_base64,
-                                'page_number': getattr(chunk.metadata, 'page_number', 1)
-                            })
-        
+        for chunk in elements:
+            try:
+                if isinstance(chunk, Table):
+                    tables.append({
+                        'content': getattr(chunk, 'text', ''),
+                        'page_number': getattr(chunk.metadata, 'page_number', 1),
+                        'html': getattr(chunk.metadata, 'text_as_html', '')
+                    })
+                elif isinstance(chunk, CompositeElement):
+                    # CompositeElement may contain text, tables, and images
+                    if hasattr(chunk, 'text') and chunk.text:
+                        texts.append({
+                            'content': chunk.text,
+                            'page_number': getattr(chunk.metadata, 'page_number', 1)
+                        })
+                    if hasattr(chunk, 'metadata') and hasattr(chunk.metadata, 'orig_elements'):
+                        for el in chunk.metadata.orig_elements:
+                            el_type = type(el).__name__
+                            snippet = getattr(el, "text", "")[:60] if hasattr(el, "text") else "[No Text]"
+                            # Print/log for debugging
+                            print(f"  └ {el_type} – {repr(snippet)}")
+                            if isinstance(el, Table):
+                                tables.append({
+                                    'content': getattr(el, 'text', ''),
+                                    'page_number': getattr(el.metadata, 'page_number', 1),
+                                    'html': getattr(el.metadata, 'text_as_html', '')
+                                })
+                            elif isinstance(el, Image) and hasattr(el.metadata, 'image_base64'):
+                                images.append({
+                                    'base64': el.metadata.image_base64,
+                                    'page_number': getattr(chunk.metadata, 'page_number', 1)
+                                })
+                elif isinstance(chunk, Image) and hasattr(chunk.metadata, 'image_base64'):
+                    images.append({
+                        'base64': chunk.metadata.image_base64,
+                        'page_number': getattr(chunk.metadata, 'page_number', 1)
+                    })
+                else:
+                    # Fallback: treat as text if it has a text attribute
+                    if hasattr(chunk, 'text') and chunk.text:
+                        texts.append({
+                            'content': chunk.text,
+                            'page_number': getattr(chunk.metadata, 'page_number', 1)
+                        })
+            except Exception as e:
+                print(f"Error processing chunk: {e}")
+                continue
         return texts, tables, images
     except Exception as e:
         raise ValueError(f"Failed to process {uploaded_file.name}: {str(e)}")
@@ -470,15 +497,15 @@ with tab1:
             </style>
         """, unsafe_allow_html=True)
         process_clicked = st.button("Process and Store Documents")
-        st.subheader("Extraction Preview")
         if process_clicked:
+            st.subheader("Extraction Preview")
             # Check for existing collection and show info
             existing_collections = get_all_collections()
             collection_exists = any(coll.name == company_name for coll in existing_collections)
             if collection_exists:
                 col_info = get_collection_info(company_name)
                 st.warning(f"Collection '{company_name}' already exists with model: {col_info.get('model', 'Unknown')}")
-                st.info("Documents will be added to the existing collection. Make sure the embedding model matches!")
+                # st.info("Documents will be added to the existing collection. Make sure the embedding model matches!")
             collection = client.get_or_create_collection(
                 name=company_name, 
                 embedding_function=embed_function
