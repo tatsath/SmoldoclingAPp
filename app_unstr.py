@@ -24,6 +24,9 @@ from unstructured.partition.pdf import partition_pdf
 from unstructured.documents.elements import CompositeElement, NarrativeText, Image, Table
 import base64
 
+# Add langchain_aws imports
+from langchain_aws import BedrockEmbeddings
+
 # Set wide layout
 st.set_page_config(layout="wide")
 # Restore previous blue panel (Kulla, not fixed, margin below)
@@ -42,76 +45,19 @@ SECTIONS = [
 load_dotenv()
 
 # ------------------ MODEL CONFIGURATIONS ------------------ #
-TITAN_V2_CONFIG = {
-    "modelId": "amazon.titan-embed-text-v2:0",
-    "contentType": "application/json",
-    "accept": "*/*",
-    "body_template": {
-        "inputText": "",
-        "dimensions": 512,
-        "normalize": True
-    }
-}
-
-CLAUDE_HAIKU_CONFIG = {
-    "modelId": "anthropic.claude-3-haiku-20240307-v1:0",
-    "contentType": "application/json",
-    "accept": "application/json",
-    "body_template": {
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1000,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": ""
-                    }
-                ]
-            }
-        ]
-    }
-}
 
 # ------------------ SETTINGS ------------------ #
-# Get AWS Bedrock credentials from environment variable
-aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
-aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-aws_region = os.getenv("AWS_REGION")
+# # Get AWS Bedrock credentials from environment variable
+# aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+# aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+# aws_region = os.getenv("AWS_REGION")
 
-bedrock = boto3.client(
-    service_name="bedrock-runtime",
-    region_name=aws_region,
-    aws_access_key_id=aws_access_key_id,
-    aws_secret_access_key=aws_secret_access_key,
-)
-
-# Bedrock Embedding Function for ChromaDB
-class BedrockEmbeddingFunction:
-    def __init__(self, model_id=TITAN_V2_CONFIG["modelId"]):
-        self.model_id = model_id
-        self.dim = TITAN_V2_CONFIG["body_template"]["dimensions"]
-    def __call__(self, input):
-        if isinstance(input, str):
-            input = [input]
-        embeddings = []
-        for text in input:
-            body = TITAN_V2_CONFIG["body_template"].copy()
-            body["inputText"] = text
-            response = bedrock.invoke_model(
-                modelId=self.model_id,
-                body=json.dumps(body),
-                accept=TITAN_V2_CONFIG["accept"],
-                contentType=TITAN_V2_CONFIG["contentType"]
-            )
-            result = json.loads(response['body'].read())
-            embeddings.append(result['embedding'])
-        return embeddings
-    def name(self):
-        return self.model_id
-
-embed_function = BedrockEmbeddingFunction()
+# bedrock = boto3.client(
+#     service_name="bedrock-runtime",
+#     region_name=aws_region,
+#     aws_access_key_id=aws_access_key_id,
+#     aws_secret_access_key=aws_secret_access_key,
+# )
 
 # Initialize ChromaDB client with new configuration
 CHROMA_DB_PATH = "./chroma_titan_v2"  # Changed to reflect the model being used
@@ -125,16 +71,77 @@ doc_converter = DocumentConverter(
     }
 )
 
+def enable_bedrock(region='ap-south-1', embedding_model_id="amazon.titan-embed-text-v2:0"):
+    """
+    Enable AWS Bedrock using credentials and region from environment variables.
+    Returns a Bedrock runtime client and BedrockEmbeddings object.
+    """
+    # Set region if not already set
+    if not os.environ.get('AWS_REGION'):
+        os.environ['AWS_REGION'] = region
+
+    # Create Bedrock runtime client using environment variables what
+    bedrock_runtime = boto3.client(
+        "bedrock-runtime",
+        region_name=os.environ['AWS_REGION'],
+        aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+        aws_session_token=os.environ.get('AWS_SESSION_TOKEN')  # This will be None if not set, which is fine
+    )
+
+    # Create Bedrock embeddings object (adjust model_id as needed)
+    bedrock_embeddings = BedrockEmbeddings(
+        model_id=embedding_model_id,
+        client=bedrock_runtime
+    )
+
+    return bedrock_runtime, bedrock_embeddings
+
+# Define model IDs at the top for global use
+BEDROCK_EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
+CHAT_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
+
+bedrock_runtime, bedrock_embeddings = enable_bedrock(embedding_model_id=BEDROCK_EMBEDDING_MODEL_ID)
+
+# Wrapper to make BedrockEmbeddings compatible with ChromaDB
+class ChromaBedrockEmbeddingWrapper:
+    def __init__(self, bedrock_embeddings):
+        self.bedrock_embeddings = bedrock_embeddings
+        self.model_id = getattr(bedrock_embeddings, "model_id", "bedrock")
+    def __call__(self, input):
+        # input is a list of strings
+        if hasattr(self.bedrock_embeddings, "embed_documents"):
+            return self.bedrock_embeddings.embed_documents(input)
+        elif hasattr(self.bedrock_embeddings, "__call__"):
+            return self.bedrock_embeddings(input)
+        else:
+            raise RuntimeError("bedrock_embeddings has no suitable embedding method (embed_documents or __call__)")
+    def name(self):
+        return str(self.model_id)
+
+chroma_embedding_function = ChromaBedrockEmbeddingWrapper(bedrock_embeddings)
+
 # Bedrock Chat Completion
-def bedrock_chat(prompt, model_id=CLAUDE_HAIKU_CONFIG["modelId"]):
-    body = CLAUDE_HAIKU_CONFIG["body_template"].copy()
-    body["messages"][0]["content"][0]["text"] = prompt
-    
-    response = bedrock.invoke_model(
+def bedrock_chat(prompt, model_id=None):
+    if model_id is None:
+        model_id = CHAT_MODEL_ID
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1000,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+    }
+    response = bedrock_runtime.invoke_model(
         modelId=model_id,
         body=json.dumps(body),
-        accept=CLAUDE_HAIKU_CONFIG["accept"],
-        contentType=CLAUDE_HAIKU_CONFIG["contentType"]
+        accept="application/json",
+        contentType="application/json"
     )
     result = json.loads(response['body'].read())
     return result['content'][0]['text']
@@ -303,76 +310,80 @@ def process_file_with_unstructured(uploaded_file):
             pass  # Ignore cleanup errors
 
 def summarize_text_with_bedrock(text_content):
-    """Summarize text using AWS Bedrock"""
-    prompt = f"""You are an assistant tasked with summarizing text.
-Give a concise summary of the text.
-
-Respond only with the summary, no additional comment.
-Do not start your message by saying "Here is a summary" or anything like that.
-Just give the summary as it is.
-
-Text chunk: {text_content}"""
-    
-    body = CLAUDE_HAIKU_CONFIG["body_template"].copy()
-    body["messages"][0]["content"][0]["text"] = prompt
-    
-    response = bedrock.invoke_model(
-        modelId=CLAUDE_HAIKU_CONFIG["modelId"],
+    prompt = f"You are an assistant tasked with summarizing text.\nGive a concise summary of the text.\n\nRespond only with the summary, no additional comment.\nDo not start your message by saying \"Here is a summary\" or anything like that.\nJust give the summary as it is.\n\nText chunk: {text_content}"
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1000,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+    }
+    response = bedrock_runtime.invoke_model(
+        modelId=CHAT_MODEL_ID,
         body=json.dumps(body),
-        accept=CLAUDE_HAIKU_CONFIG["accept"],
-        contentType=CLAUDE_HAIKU_CONFIG["contentType"]
+        accept="application/json",
+        contentType="application/json"
     )
     result = json.loads(response['body'].read())
     return result['content'][0]['text']
 
 def summarize_table_with_bedrock(table_html):
-    """Summarize table using AWS Bedrock"""
-    prompt = f"""You are an assistant tasked with summarizing tables.
-Give a concise summary of the table.
-
-Respond only with the summary, no additional comment.
-Do not start your message by saying "Here is a summary" or anything like that.
-Just give the summary as it is.
-
-Table HTML: {table_html}"""
-    
-    body = CLAUDE_HAIKU_CONFIG["body_template"].copy()
-    body["messages"][0]["content"][0]["text"] = prompt
-    
-    response = bedrock.invoke_model(
-        modelId=CLAUDE_HAIKU_CONFIG["modelId"],
+    prompt = f"You are an assistant tasked with summarizing tables.\nGive a concise summary of the table.\n\nRespond only with the summary, no additional comment.\nDo not start your message by saying \"Here is a summary\" or anything like that.\nJust give the summary as it is.\n\nTable HTML: {table_html}"
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1000,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+    }
+    response = bedrock_runtime.invoke_model(
+        modelId=CHAT_MODEL_ID,
         body=json.dumps(body),
-        accept=CLAUDE_HAIKU_CONFIG["accept"],
-        contentType=CLAUDE_HAIKU_CONFIG["contentType"]
+        accept="application/json",
+        contentType="application/json"
     )
     result = json.loads(response['body'].read())
     return result['content'][0]['text']
 
 def summarize_image_with_bedrock(image_base64):
-    """Summarize image using AWS Bedrock"""
     if not image_base64 or not isinstance(image_base64, str) or image_base64.strip() == "":
         raise ValueError("Image base64 data is missing or invalid")
-    prompt = f"""Describe the image in detail. Be specific about any graphs, charts, or visual elements."""
-    body = CLAUDE_HAIKU_CONFIG["body_template"].copy()
-    body["messages"][0]["content"] = [
-        {
-            "type": "text",
-            "text": prompt
-        },
-        {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/jpeg",
-                "data": image_base64
+    prompt = f"Describe the image in detail. Be specific about any graphs, charts, or visual elements."
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1000,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_base64
+                        }
+                    }
+                ]
             }
-        }
-    ]
-    response = bedrock.invoke_model(
-        modelId=CLAUDE_HAIKU_CONFIG["modelId"],
+        ]
+    }
+    response = bedrock_runtime.invoke_model(
+        modelId=CHAT_MODEL_ID,
         body=json.dumps(body),
-        accept=CLAUDE_HAIKU_CONFIG["accept"],
-        contentType=CLAUDE_HAIKU_CONFIG["contentType"]
+        accept="application/json",
+        contentType="application/json"
     )
     result = json.loads(response['body'].read())
     return result['content'][0]['text']
@@ -423,6 +434,8 @@ with tab1:
     st.subheader("Data Upload")
     col_left, col_center, col_right = st.columns([6, 1, 1])
     with col_left:
+        # Prompt user for data store name
+        data_store_name = st.text_input("Enter a data store name")
         uploaded_files = st.file_uploader(
             "Upload multiple documents (PDF/TXT/IMP)",
             type=['pdf', 'txt', 'imp'],
@@ -456,13 +469,11 @@ with tab1:
         all_files_option = "All Files"
         doc_names_with_all = [all_files_option] + doc_names
         for section in SECTIONS:
-            col1, col2, col3 = st.columns([4, 6, 1])
-            with col1:
-                selected_docs = st.multiselect(
-                    f"Select documents for section: {section['name']}",
-                    doc_names_with_all,
-                    key=f"map_{section['name']}"
-                )
+            selected_docs = st.multiselect(
+                f"Select documents for section: {section['name']}",
+                doc_names_with_all,
+                key=f"map_{section['name']}"
+            )
             if all_files_option in selected_docs:
                 selected_docs = doc_names
             section_to_docs[section["name"]] = selected_docs
@@ -500,26 +511,30 @@ with tab1:
         """, unsafe_allow_html=True)
         process_clicked = st.button("Process and Store Documents")
 
-    # Generate a data store name using a regex to extract a valid single word (3-20 lowercase letters)
-    def extract_ticker(files):
-        if not files:
-            return "autodb"
-        base = os.path.splitext(files[0].name)[0]
-        # Extract a single word, 3-20 lowercase letters
-        match = re.search(r'([a-zA-Z]{3,20})', base)
-        if match:
-            return match.group(1).lower()
-        return "autodb"
-
-    data_store_name = extract_ticker(nonempty_files)
-
     if process_clicked:
         st.subheader("Extraction Preview")
-        # Always create a new collection with the generated data_store_name
-        collection = client.get_or_create_collection(
-            name=data_store_name,
-            embedding_function=embed_function
-        )
+        # Try to get or create the collection, handle embedding dimension errors
+        try:
+            collection = client.get_or_create_collection(
+                name=data_store_name,
+                embedding_function=chroma_embedding_function
+            )
+        except Exception as e:
+            if "dimension" in str(e) or "embedding" in str(e):
+                st.warning("Collection embedding dimension mismatch. Deleting and recreating collection...")
+                try:
+                    client.delete_collection(name=data_store_name)
+                    collection = client.get_or_create_collection(
+                        name=data_store_name,
+                        embedding_function=chroma_embedding_function
+                    )
+                    st.success("Collection recreated successfully.")
+                except Exception as e2:
+                    st.error(f"Failed to recreate collection: {e2}")
+                    st.stop()
+            else:
+                st.error(f"Failed to get or create collection: {e}")
+                st.stop()
         all_chunks = []
         total_files = len(nonempty_files)
         preview_progress = st.progress(0, text="Starting extraction and storage...")
@@ -666,7 +681,7 @@ with tab2:
                 try:
                     collection = client.get_collection(
                         name=data_store_name,
-                        embedding_function=embed_function
+                        embedding_function=chroma_embedding_function
                     )
                     # Use query_texts for semantic search
                     results = collection.query(
@@ -705,7 +720,7 @@ Please provide a comprehensive answer based on the context above."""
 with tab3:
     st.header("Validation")
     st.subheader("Current Configuration")
-    st.write(f"**Embedding Model:** {embed_function.model_id}")
+    st.write(f"**Embedding Model:** {bedrock_embeddings.model_id}")
     st.write(f"**ChromaDB Path:** {CHROMA_DB_PATH}")
     
     st.subheader("Collection Details")
@@ -740,3 +755,4 @@ with tab3:
 with tab4:
     st.header("Custom Report Section")
     st.info("This section will allow you to generate custom report sections. (Coming soon)")
+
