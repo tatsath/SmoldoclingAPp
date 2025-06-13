@@ -3,10 +3,6 @@ import chromadb
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import EasyOcrOptions, PdfPipelineOptions
-from docling.document_converter import DocumentConverter, PdfFormatOption
-
 import uuid
 import os
 import time
@@ -19,10 +15,7 @@ import json
 from pathlib import Path
 import pandas as pd
 
-# Add Unstructured imports
-from unstructured.partition.pdf import partition_pdf
-from unstructured.documents.elements import CompositeElement, NarrativeText, Image, Table
-import base64
+# Remove docling imports
 
 # Add langchain_aws imports
 from langchain_aws import BedrockEmbeddings
@@ -30,6 +23,9 @@ from langchain_aws import BedrockEmbeddings
 # Add robust extraction for DOCX and PPTX
 from unstructured.partition.docx import partition_docx
 from unstructured.partition.pptx import partition_pptx
+from unstructured.partition.pdf import partition_pdf
+from unstructured.documents.elements import CompositeElement, NarrativeText, Image, Table
+import base64
 
 # Set wide layout
 st.set_page_config(layout="wide")
@@ -66,14 +62,6 @@ load_dotenv()
 # Initialize ChromaDB client with new configuration
 CHROMA_DB_PATH = "./chroma_titan_v2"  # Changed to reflect the model being used
 client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-
-artifacts_path = "/Users/tatsa/.cache/docling/models"
-pipeline_options = PdfPipelineOptions(artifacts_path=artifacts_path)
-doc_converter = DocumentConverter(
-    format_options={
-        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-    }
-)
 
 def enable_bedrock(region='ap-south-1', embedding_model_id="amazon.titan-embed-text-v2:0"):
     """
