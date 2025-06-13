@@ -150,49 +150,6 @@ def bedrock_chat(prompt, model_id=None):
     result = json.loads(response['body'].read())
     return result['content'][0]['text']
 
-# ------------------ UTILS ------------------ #
-def chunk_text(text, chunk_size=2000, overlap=200):
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + chunk_size, len(text))
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return chunks
-
-def parse_markdown_sections(markdown_text):
-    sections = []
-    current_section = {"title": "Introduction", "content": ""}
-    
-    # Split by headers (## or ###)
-    lines = markdown_text.split('\n')
-    for line in lines:
-        if line.startswith('## '):
-            # Save previous section if it has content
-            if current_section["content"].strip():
-                sections.append(current_section)
-            # Start new section
-            current_section = {
-                "title": line[3:].strip(),
-                "content": ""
-            }
-        elif line.startswith('### '):
-            # Save previous section if it has content
-            if current_section["content"].strip():
-                sections.append(current_section)
-            # Start new section
-            current_section = {
-                "title": line[4:].strip(),
-                "content": ""
-            }
-        else:
-            current_section["content"] += line + "\n"
-    
-    # Add the last section if it has content
-    if current_section["content"].strip():
-        sections.append(current_section)
-    
-    return sections
 
 def process_file_with_unstructured(uploaded_file):
     # Save uploaded file to temp
