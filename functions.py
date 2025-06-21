@@ -4,12 +4,16 @@ import requests
 import pandas as pd
 import yfinance as yf
 import concurrent.futures
+import io
+import base64
+from datetime import date
 
 from typing import List
 from bs4 import BeautifulSoup
 from utils import inference_logger
 from langchain.tools import tool
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from lxml import etree
 
 @tool
 def code_interpreter(code_markdown: str) -> dict | str:
@@ -32,28 +36,36 @@ def code_interpreter(code_markdown: str) -> dict | str:
     """
     try:
         # Extracting code from Markdown code block
-        code_lines = code_markdown.split('\n')[1:-1]
+        code_lines = code_markdown.strip().split('\n')
+        if code_lines[0].strip().startswith("```"):
+             code_lines = code_lines[1:]
+        if code_lines[-1].strip() == "```":
+             code_lines = code_lines[:-1]
         code_without_markdown = '\n'.join(code_lines)
 
         # Create a new namespace for code execution
         exec_namespace = {}
-
-        # Execute the code in the new namespace
+        
+        # Capture stdout
+        stdout_capture = io.StringIO()
+        
+        # Execute the code in the new namespace, redirecting stdout
         exec(code_without_markdown, exec_namespace)
-
-        # Collect variables and function call results
+        
+        # After execution, check for plots
         result_dict = {}
-        for name, value in exec_namespace.items():
-            if callable(value):
-                try:
-                    result_dict[name] = value()
-                except TypeError:
-                    # If the function requires arguments, attempt to call it with arguments from the namespace
-                    arg_names = inspect.getfullargspec(value).args
-                    args = {arg_name: exec_namespace.get(arg_name) for arg_name in arg_names}
-                    result_dict[name] = value(**args)
-            elif not name.startswith('_'):  # Exclude variables starting with '_'
-                result_dict[name] = value
+        if 'plt' in exec_namespace and hasattr(exec_namespace['plt'], 'get_fignums') and exec_namespace['plt'].get_fignums():
+            buf = io.BytesIO()
+            exec_namespace['plt'].savefig(buf, format='png')
+            buf.seek(0)
+            # Encode the plot to base64
+            result_dict['plot_image'] = base64.b64encode(buf.getvalue()).decode('utf-8')
+            exec_namespace['plt'].close() # Close the plot to free memory
+        
+        # Restore stdout and get the captured output
+        output = stdout_capture.getvalue()
+        if output:
+            result_dict['stdout'] = output
 
         return result_dict
 
@@ -81,10 +93,23 @@ def google_search_and_scrape(query: str) -> dict:
     inference_logger.info(f"Performing google search with query: {query}\nplease wait...")
     response = requests.get(url, params=params, headers=headers)
     soup = BeautifulSoup(response.text, 'html.parser')
-    urls = [result.find('a')['href'] for result in soup.find_all('div', class_='tF2Cxc')]
     
-    inference_logger.info(f"Scraping text from urls, please wait...") 
+    # Use lxml for parsing and robust XPath selectors
+    dom = etree.HTML(str(soup))
+    
+    # This XPath is more robust as it doesn't rely on volatile class names.
+    # It finds the main results block and then iterates through the individual result containers.
+    search_results = dom.xpath('//div[h3 and .//a]')
+    
+    urls = [result.xpath('.//a/@href')[0] for result in search_results if result.xpath('.//a/@href')]
+
+    # If no URLs are found, it's a failure. Return a clear error.
+    if not urls:
+        return {"error": "The Google Search tool failed to retrieve any results. The page format may have changed, or the search returned no results."}
+    
+    inference_logger.info(f"Scraping text from {len(urls)} urls, please wait...")
     [inference_logger.info(url) for url in urls]
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(lambda url: (url, requests.get(url, headers=headers).text if isinstance(url, str) else None), url) for url in urls[:num_results] if isinstance(url, str)]
         results = []
@@ -128,42 +153,37 @@ def get_stock_fundamentals(symbol: str) -> dict:
         symbol (str): The stock symbol.
 
     Returns:
-        dict: A dictionary containing fundamental data.
-            Keys:
-                - 'symbol': The stock symbol.
-                - 'company_name': The long name of the company.
-                - 'sector': The sector to which the company belongs.
-                - 'industry': The industry to which the company belongs.
-                - 'market_cap': The market capitalization of the company.
-                - 'pe_ratio': The forward price-to-earnings ratio.
-                - 'pb_ratio': The price-to-book ratio.
-                - 'dividend_yield': The dividend yield.
-                - 'eps': The trailing earnings per share.
-                - 'beta': The beta value of the stock.
-                - '52_week_high': The 52-week high price of the stock.
-                - '52_week_low': The 52-week low price of the stock.
+        dict: A dictionary containing fundamental data, or an error dictionary if data cannot be retrieved.
     """
     try:
         stock = yf.Ticker(symbol)
         info = stock.info
+
+        # yfinance can return a mostly empty dict if the ticker is invalid or data is missing.
+        # We check for a key that should almost always be present for a valid public company.
+        if not info or not info.get('longName'):
+            return {"error": f"Could not retrieve fundamental data for symbol: {symbol}. The symbol may be invalid or no data is available."}
+
         fundamentals = {
             'symbol': symbol,
-            'company_name': info.get('longName', ''),
-            'sector': info.get('sector', ''),
-            'industry': info.get('industry', ''),
-            'market_cap': info.get('marketCap', None),
-            'pe_ratio': info.get('forwardPE', None),
-            'pb_ratio': info.get('priceToBook', None),
-            'dividend_yield': info.get('dividendYield', None),
-            'eps': info.get('trailingEps', None),
-            'beta': info.get('beta', None),
-            '52_week_high': info.get('fiftyTwoWeekHigh', None),
-            '52_week_low': info.get('fiftyTwoWeekLow', None)
+            'company_name': info.get('longName'),
+            'sector': info.get('sector'),
+            'industry': info.get('industry'),
+            'market_cap': info.get('marketCap'),
+            'pe_ratio': info.get('forwardPE'),
+            'pb_ratio': info.get('priceToBook'),
+            'dividend_yield': info.get('dividendYield'),
+            'eps': info.get('trailingEps'),
+            'beta': info.get('beta'),
+            '52_week_high': info.get('fiftyTwoWeekHigh'),
+            '52_week_low': info.get('fiftyTwoWeekLow')
         }
-        return fundamentals
+        # Clean up None values for a cleaner output to the model and UI
+        return {k: v for k, v in fundamentals.items() if v is not None}
+
     except Exception as e:
-        print(f"Error getting fundamentals for {symbol}: {e}")
-        return {}
+        inference_logger.error(f"Error getting fundamentals for {symbol}: {e}")
+        return {"error": f"An unexpected error occurred while fetching fundamentals: {e}"}
 
 @tool
 def get_financial_statements(symbol: str) -> dict:
@@ -242,6 +262,54 @@ def get_dividend_data(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 @tool
+def get_todays_weather(location: str) -> dict:
+    """
+    Get the current weather for a given location.
+
+    Args:
+        location (str): The city or area for which to get the weather. E.g., "San Francisco", "London".
+
+    Returns:
+        dict: A dictionary containing the current weather conditions.
+    """
+    try:
+        # wttr.in provides a simple JSON API
+        url = f"https://wttr.in/{location}?format=j1"
+        response = requests.get(url)
+        response.raise_for_status()  # Raise an exception for bad status codes
+        
+        weather_data = response.json()
+        
+        # Extract the most relevant current information
+        current_condition = weather_data.get('current_condition', [{}])[0]
+        
+        return {
+            "location": weather_data.get('nearest_area', [{}])[0].get('value', location),
+            "current_temp_c": current_condition.get('temp_C'),
+            "current_temp_f": current_condition.get('temp_F'),
+            "description": current_condition.get('weatherDesc', [{}])[0].get('value'),
+            "wind_speed_mph": current_condition.get('windspeedMiles'),
+            "humidity": current_condition.get('humidity'),
+            "precipitation_mm": current_condition.get('precipMM')
+        }
+    except requests.exceptions.HTTPError as http_err:
+        if response.status_code == 404:
+            return {"error": f"Location '{location}' not found."}
+        else:
+            return {"error": f"HTTP error occurred: {http_err}"}
+    except Exception as e:
+        inference_logger.error(f"Error fetching weather for {location}: {e}")
+        return {"error": f"An error occurred while fetching weather data: {e}"}
+
+@tool
+def get_todays_date() -> str:
+    """
+    Returns today's date in YYYY-MM-DD format.
+    This function takes no arguments.
+    """
+    return date.today().isoformat()
+
+@tool
 def get_company_news(symbol: str) -> pd.DataFrame:
     """
     Get company news and press releases for a given stock symbol.
@@ -296,7 +364,7 @@ def get_company_profile(symbol: str) -> dict:
         return {}
 
 def get_openai_tools() -> List[dict]:
-    functions = [
+    all_funcs = [
         code_interpreter,
         google_search_and_scrape,
         get_current_stock_price,
@@ -307,8 +375,9 @@ def get_openai_tools() -> List[dict]:
         get_key_financial_ratios,
         get_analyst_recommendations,
         get_dividend_data,
+        get_todays_weather,
+        get_todays_date,
         get_technical_indicators
     ]
-
-    tools = [convert_to_openai_tool(f) for f in functions]
+    tools = [convert_to_openai_tool(f) for f in all_funcs]
     return tools
