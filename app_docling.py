@@ -15,16 +15,19 @@ import json
 from pathlib import Path
 import pandas as pd
 
-# Remove docling imports
-
 # Add langchain_aws imports
 from langchain_aws import BedrockEmbeddings
 
-# Add robust extraction for DOCX and PPTX
-from unstructured.partition.docx import partition_docx
-from unstructured.partition.pptx import partition_pptx
-from unstructured.partition.pdf import partition_pdf
-from unstructured.documents.elements import CompositeElement, NarrativeText, Image, Table
+# Add docling imports for SmolVLM pipeline
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import (
+    VlmPipelineOptions,
+    smoldocling_vlm_mlx_conversion_options,
+    smoldocling_vlm_conversion_options,
+)
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.pipeline.vlm_pipeline import VlmPipeline
+from docling_core.types.doc import PictureItem, TableItem
 import base64
 
 # Set wide layout
@@ -45,6 +48,13 @@ SECTIONS = [
 load_dotenv()
 
 # ------------------ MODEL CONFIGURATIONS ------------------ #
+
+# VLM Model Configuration
+VLM_MODELS = {
+    "SmolDocling MLX": smoldocling_vlm_mlx_conversion_options,
+    "SmolDocling Transformers": smoldocling_vlm_conversion_options,
+    "Default": None  # Use default pipeline only
+}
 
 # ------------------ SETTINGS ------------------ #
 # # Get AWS Bedrock credentials from environment variable
@@ -138,8 +148,15 @@ def bedrock_chat(prompt, model_id=None):
     result = json.loads(response['body'].read())
     return result['content'][0]['text']
 
-
-def process_file_with_unstructured(uploaded_file):
+def process_file_with_docling(uploaded_file, vlm_model_name="SmolDocling MLX"):
+    """
+    Process uploaded file using docling with SmolVLM pipeline for image-based pages
+    and default pipeline for text/tables.
+    
+    Args:
+        uploaded_file: The uploaded file to process
+        vlm_model_name: Name of the VLM model to use (from VLM_MODELS keys)
+    """
     # Save uploaded file to temp
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as temp_file:
         uploaded_file.seek(0)
@@ -155,110 +172,223 @@ def process_file_with_unstructured(uploaded_file):
         file_size = os.path.getsize(temp_path)
         if file_size == 0:
             raise ValueError(f"File is empty (size: {file_size} bytes)")
+        
         ext = os.path.splitext(temp_path)[1].lower()
+        
+        # Initialize converters
+        # VLM pipeline for image-based pages
+        vlm_converter = None
+        if vlm_model_name in VLM_MODELS and VLM_MODELS[vlm_model_name] is not None:
+            try:
+                vlm_opts = VlmPipelineOptions(vlm_options=VLM_MODELS[vlm_model_name])
+                vlm_converter = DocumentConverter(format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_cls=VlmPipeline, pipeline_options=vlm_opts)
+                })
+                st.info(f"Using VLM model: {vlm_model_name}")
+            except Exception as e:
+                st.warning(f"Failed to initialize VLM converter with {vlm_model_name}: {str(e)}. Using default converter only.")
+                vlm_converter = None
+        else:
+            st.info("Using default pipeline only (no VLM processing)")
+        
+        # Default pipeline for all PDF text/tables with image extraction
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.images_scale = 2.0  # Higher resolution for better quality
+        pipeline_options.generate_page_images = True
+        pipeline_options.generate_picture_images = True
+        
+        default_converter = DocumentConverter(format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+        })
+        
+        # Process based on file type
         if ext == ".pdf":
-            elements = partition_pdf(
-                filename=temp_path,
-                extract_images_in_pdf=True,
-                infer_table_structure=True,
-                strategy="hi_res",
-                hi_res_model_name="yolox",
-                chunking_strategy="by_title",
-                extract_image_block_to_payload=True,
-                max_characters=4000,
-                new_after_n_chars=3800,
-                combine_text_under_n_chars=2000,
-                image_output_dir_path='imgs',
-            )
-        elif ext in [".doc", ".docx"]:
-            elements = partition_docx(
-                filename=temp_path,
-                extract_images_in_docx=True,
-                extract_image_block_to_payload=True,
-                image_output_dir_path='imgs',
-            )
-        elif ext in [".ppt", ".pptx"]:
-            elements = partition_pptx(
-                filename=temp_path,
-                extract_images_in_pptx=True,
-                extract_image_block_to_payload=True,
-                image_output_dir_path='imgs',
-            )
+            # Convert PDF using default pipeline
+            conv_res = default_converter.convert(temp_path)
+            doc = conv_res.document
+            
+            # Detect image-only pages and replace using VLM if available
+            if vlm_converter:
+                vlm_processed_pages = 0
+                for page_no, page in doc.pages.items():
+                    # Check if page has no text but contains images
+                    page_has_text = hasattr(page, 'text') and page.text and page.text.strip()
+                    page_has_images = hasattr(page, 'image') and page.image and hasattr(page.image, 'pil_image')
+                    
+                    # Only process if page has no text but has a valid image
+                    if not page_has_text and page_has_images:
+                        st.info(f"Detected image-only page {page_no}, attempting VLM processing...")
+                        # For image-only pages, use VLM pipeline
+                        try:
+                            # Create a temporary image file for VLM processing
+                            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as img_temp:
+                                page.image.pil_image.save(img_temp, format="PNG")
+                                img_temp_path = img_temp.name
+                            
+                            try:
+                                # Check if the image file was created and has content
+                                if os.path.exists(img_temp_path) and os.path.getsize(img_temp_path) > 0:
+                                    img_conv_res = vlm_converter.convert(img_temp_path)
+                                    if img_conv_res and img_conv_res.document and img_conv_res.document.pages:
+                                        # Replace the page with VLM processed content
+                                        doc.pages[page_no] = img_conv_res.document.pages[0]
+                                        vlm_processed_pages += 1
+                                        st.info(f"Successfully processed page {page_no} with VLM")
+                                    else:
+                                        st.warning(f"VLM processing returned empty result for page {page_no}")
+                                else:
+                                    st.warning(f"Failed to create valid image file for page {page_no}")
+                            except Exception as e:
+                                st.warning(f"VLM processing failed for page {page_no}: {str(e)}")
+                            finally:
+                                try:
+                                    os.unlink(img_temp_path)
+                                except:
+                                    pass
+                        except Exception as e:
+                            st.warning(f"Failed to prepare image for VLM processing on page {page_no}: {str(e)}")
+                    elif not page_has_text and not page_has_images:
+                        st.info(f"Page {page_no} has no text and no images - skipping VLM processing")
+                    elif page_has_text:
+                        st.info(f"Page {page_no} has text content - skipping VLM processing")
+                
+                if vlm_processed_pages > 0:
+                    st.success(f"Successfully processed {vlm_processed_pages} image pages with VLM")
+                else:
+                    st.info("No pages were processed with VLM (this is normal if all pages have text content)")
+            
+            # Extract content from processed document
+            texts = []
+            tables = []
+            images = []
+            
+            # Extract text from pages
+            for page_no, page in doc.pages.items():
+                if hasattr(page, 'text') and page.text and page.text.strip():
+                    texts.append({
+                        'content': page.text.strip(),
+                        'page_number': page_no
+                    })
+            
+            # Extract tables from document
+            for table_ix, table in enumerate(doc.tables):
+                try:
+                    # Get table content as DataFrame
+                    table_df = table.export_to_dataframe()
+                    table_content = table_df.to_string()
+                    table_html = table.export_to_html(doc=doc)
+                    
+                    # Get page number for table (approximate)
+                    table_page = 1  # Default page
+                    if hasattr(table, 'page_no'):
+                        table_page = table.page_no
+                    
+                    tables.append({
+                        'content': table_content,
+                        'page_number': table_page,
+                        'html': table_html,
+                        'dataframe': table_df
+                    })
+                except Exception as e:
+                    st.warning(f"Failed to process table {table_ix}: {e}")
+            
+            # Extract images from document
+            # Extract images from figures/pictures
+            picture_counter = 0
+            for element, _level in doc.iterate_items():
+                if isinstance(element, PictureItem):
+                    picture_counter += 1
+                    try:
+                        # Get image from picture element
+                        img = element.get_image(doc)
+                        if img:
+                            # Convert PIL image to base64
+                            import io
+                            img_buffer = io.BytesIO()
+                            img.save(img_buffer, format='PNG')
+                            img_b64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+                            
+                            images.append({
+                                'base64': img_b64,
+                                'page_number': getattr(element, 'page_no', 1),
+                                'type': 'picture',
+                                'index': picture_counter
+                            })
+                    except Exception as e:
+                        st.warning(f"Failed to process picture {picture_counter}: {e}")
+            
+            # Extract images from tables
+            table_img_counter = 0
+            for element, _level in doc.iterate_items():
+                if isinstance(element, TableItem):
+                    table_img_counter += 1
+                    try:
+                        # Get image from table element
+                        img = element.get_image(doc)
+                        if img:
+                            # Convert PIL image to base64
+                            import io
+                            img_buffer = io.BytesIO()
+                            img.save(img_buffer, format='PNG')
+                            img_b64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+                            
+                            images.append({
+                                'base64': img_b64,
+                                'page_number': getattr(element, 'page_no', 1),
+                                'type': 'table',
+                                'index': table_img_counter
+                            })
+                    except Exception as e:
+                        st.warning(f"Failed to process table image {table_img_counter}: {e}")
+            
+        elif ext in [".doc", ".docx", ".ppt", ".pptx"]:
+            # For other document types, use default converter
+            converter = DocumentConverter()
+            conv_res = converter.convert(temp_path)
+            doc = conv_res.document
+            
+            texts = []
+            tables = []
+            images = []
+            
+            # Extract text from pages
+            for page_no, page in doc.pages.items():
+                if hasattr(page, 'text') and page.text and page.text.strip():
+                    texts.append({
+                        'content': page.text.strip(),
+                        'page_number': page_no
+                    })
+            
+            # Extract tables
+            for table_ix, table in enumerate(doc.tables):
+                try:
+                    table_df = table.export_to_dataframe()
+                    table_content = table_df.to_string()
+                    table_html = table.export_to_html(doc=doc)
+                    
+                    tables.append({
+                        'content': table_content,
+                        'page_number': getattr(table, 'page_no', 1),
+                        'html': table_html,
+                        'dataframe': table_df
+                    })
+                except Exception as e:
+                    st.warning(f"Failed to process table {table_ix}: {e}")
+            
         elif ext == ".txt":
+            # For text files, read directly
             with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
                 text = f.read()
-            elements = [text]
+            texts = [{'content': text, 'page_number': 1}]
+            tables = []
+            images = []
+            
         else:
             raise ValueError(f"Unsupported file type: {ext}")
-        if elements is None:
-            raise ValueError(
-                f"This file could not be processed (partition returned None). It may be corrupted, encrypted, or unsupported. Try opening and re-saving the file, or use a different file."
-            )
-        if not hasattr(elements, '__len__'):
-            raise ValueError("partition did not return a list-like object")
-        # Extract tables, texts, and images robustly (same as before)
-        tables = []
-        texts = []
-        images = []
-        found_base64_set = set()
-        for chunk in elements:
-            try:
-                if isinstance(chunk, Table):
-                    tables.append({
-                        'content': getattr(chunk, 'text', ''),
-                        'page_number': getattr(chunk.metadata, 'page_number', 1),
-                        'html': getattr(chunk.metadata, 'text_as_html', '')
-                    })
-                elif isinstance(chunk, Image) and hasattr(chunk.metadata, 'image_base64') and chunk.metadata.image_base64:
-                    img_b64 = chunk.metadata.image_base64
-                    images.append({
-                        'base64': img_b64,
-                        'page_number': getattr(chunk.metadata, 'page_number', 1)
-                    })
-                    found_base64_set.add(img_b64)
-                elif isinstance(chunk, CompositeElement):
-                    if hasattr(chunk, 'text') and chunk.text:
-                        texts.append({
-                            'content': chunk.text,
-                            'page_number': getattr(chunk.metadata, 'page_number', 1)
-                        })
-                    if hasattr(chunk, 'metadata') and hasattr(chunk.metadata, 'orig_elements'):
-                        for el in chunk.metadata.orig_elements:
-                            if isinstance(el, Image) and hasattr(el.metadata, 'image_base64') and el.metadata.image_base64:
-                                img_b64 = el.metadata.image_base64
-                                if img_b64 not in found_base64_set:
-                                    images.append({
-                                        'base64': img_b64,
-                                        'page_number': getattr(chunk.metadata, 'page_number', 1)
-                                    })
-                                    found_base64_set.add(img_b64)
-                            elif isinstance(el, Table):
-                                tables.append({
-                                    'content': getattr(el, 'text', ''),
-                                    'page_number': getattr(el.metadata, 'page_number', 1),
-                                    'html': getattr(el.metadata, 'text_as_html', '')
-                                })
-                elif isinstance(chunk, str):
-                    # For TXT files
-                    texts.append({'content': chunk, 'page_number': 1})
-            except Exception as e:
-                print(f"Error processing chunk: {e}")
-                continue
-        # Fallback: read images from imgs/ directory if not already present
-        img_dir = 'imgs'
-        if os.path.isdir(img_dir):
-            for fname in os.listdir(img_dir):
-                if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    img_path = os.path.join(img_dir, fname)
-                    try:
-                        with open(img_path, 'rb') as f:
-                            b64 = base64.b64encode(f.read()).decode('utf-8')
-                            if b64 not in found_base64_set:
-                                images.append({'base64': b64, 'page_number': None})
-                                found_base64_set.add(b64)
-                    except Exception as e:
-                        print(f"Error reading image file {img_path}: {e}")
+        
         return texts, tables, images
+        
     except Exception as e:
         raise ValueError(f"Failed to process {uploaded_file.name}: {str(e)}")
     finally:
@@ -394,6 +524,25 @@ with tab1:
     with col_left:
         # Prompt user for data store name
         data_store_name = st.text_input("Enter a data store name")
+        
+        # VLM Model Selection
+        st.subheader("VLM Model Configuration")
+        vlm_model_name = st.selectbox(
+            "Select VLM Model for Image Processing",
+            options=list(VLM_MODELS.keys()),
+            index=0,
+            help="Choose the VLM model to use for processing image-only pages. SmolDocling MLX is recommended for macOS with MPS acceleration."
+        )
+        
+        # Option to disable VLM processing if needed
+        disable_vlm = st.checkbox(
+            "Disable VLM Processing (use default pipeline only)",
+            help="Check this if you're experiencing issues with VLM processing"
+        )
+        
+        if disable_vlm:
+            vlm_model_name = "Default"
+        
         uploaded_files = st.file_uploader(
             "Upload multiple documents (PDF/TXT/DOC/DOCX/PPT/PPTX)",
             type=['pdf', 'txt', 'doc', 'docx', 'ppt', 'pptx'],
@@ -503,7 +652,7 @@ with tab1:
         for idx, uploaded_file in enumerate(nonempty_files):
             status_text.text(f"Processing file {idx + 1} of {total_files}: {uploaded_file.name}")
             try:
-                texts, tables, images = process_file_with_unstructured(uploaded_file)
+                texts, tables, images = process_file_with_docling(uploaded_file, vlm_model_name)
                 doc_chunks_map[uploaded_file.name] = {'texts': [], 'tables': [], 'images': []}
                 doc_sections = doc_to_sections.get(uploaded_file.name, ["Unmapped"])
                 # Process text chunks
