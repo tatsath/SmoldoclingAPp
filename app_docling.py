@@ -18,16 +18,16 @@ import pandas as pd
 # Add langchain_aws imports
 from langchain_aws import BedrockEmbeddings
 
-# Add docling imports for SmolVLM pipeline
+# Set environment variables to avoid meta tensor errors
+os.environ['DOCLING_DISABLE_MODELS'] = '1'
+os.environ['TORCH_DEVICE'] = 'cpu'
+os.environ['DOCLING_USE_CPU'] = '1'
+
+# Add docling imports for basic pipeline
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import (
-    VlmPipelineOptions,
-    smoldocling_vlm_mlx_conversion_options,
-    smoldocling_vlm_conversion_options,
-)
+from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.pipeline.vlm_pipeline import VlmPipeline
-from docling_core.types.doc import PictureItem, TableItem
+from docling_core.types.doc import PictureItem, TableItem, TextItem, SectionHeaderItem
 import base64
 
 # Set wide layout
@@ -49,12 +49,7 @@ load_dotenv()
 
 # ------------------ MODEL CONFIGURATIONS ------------------ #
 
-# VLM Model Configuration
-VLM_MODELS = {
-    "SmolDocling MLX": smoldocling_vlm_mlx_conversion_options,
-    "SmolDocling Transformers": smoldocling_vlm_conversion_options,
-    "Default": None  # Use default pipeline only
-}
+# Basic pipeline only - VLM disabled to avoid meta tensor errors
 
 # ------------------ SETTINGS ------------------ #
 # # Get AWS Bedrock credentials from environment variable
@@ -148,14 +143,12 @@ def bedrock_chat(prompt, model_id=None):
     result = json.loads(response['body'].read())
     return result['content'][0]['text']
 
-def process_file_with_docling(uploaded_file, vlm_model_name="SmolDocling MLX"):
+def process_file_with_docling(uploaded_file):
     """
-    Process uploaded file using docling with SmolVLM pipeline for image-based pages
-    and default pipeline for text/tables.
+    Process uploaded file using docling with basic pipeline for text/tables.
     
     Args:
         uploaded_file: The uploaded file to process
-        vlm_model_name: Name of the VLM model to use (from VLM_MODELS keys)
     """
     # Save uploaded file to temp
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as temp_file:
@@ -175,101 +168,82 @@ def process_file_with_docling(uploaded_file, vlm_model_name="SmolDocling MLX"):
         
         ext = os.path.splitext(temp_path)[1].lower()
         
-        # Initialize converters
-        # VLM pipeline for image-based pages
-        vlm_converter = None
-        if vlm_model_name in VLM_MODELS and VLM_MODELS[vlm_model_name] is not None:
-            try:
-                vlm_opts = VlmPipelineOptions(vlm_options=VLM_MODELS[vlm_model_name])
-                vlm_converter = DocumentConverter(format_options={
-                    InputFormat.PDF: PdfFormatOption(pipeline_cls=VlmPipeline, pipeline_options=vlm_opts)
-                })
-                st.info(f"Using VLM model: {vlm_model_name}")
-            except Exception as e:
-                st.warning(f"Failed to initialize VLM converter with {vlm_model_name}: {str(e)}. Using default converter only.")
-                vlm_converter = None
-        else:
-            st.info("Using default pipeline only (no VLM processing)")
+        # Initialize converters with minimal configuration to avoid model loading
+        st.info("Using minimal pipeline configuration to avoid meta tensor errors")
         
-        # Default pipeline for all PDF text/tables with image extraction
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        # Create minimal pipeline options to avoid model loading
         pipeline_options = PdfPipelineOptions()
-        pipeline_options.images_scale = 2.0  # Higher resolution for better quality
-        pipeline_options.generate_page_images = True
-        pipeline_options.generate_picture_images = True
+        pipeline_options.force_backend_text = True  # Use PDF backend for text extraction
+        pipeline_options.do_ocr = False  # Disable OCR to avoid model loading
+        pipeline_options.do_table_structure = True  # Enable table detection
+        pipeline_options.do_picture_classification = False  # Disable to avoid model loading
+        pipeline_options.do_picture_description = False  # Disable to avoid model loading
+        pipeline_options.do_code_enrichment = False  # Disable to avoid model loading
+        pipeline_options.do_formula_enrichment = False  # Disable to avoid model loading
+        pipeline_options.generate_page_images = True  # Enable image generation for extraction
+        pipeline_options.generate_picture_images = True  # Enable picture image generation
+        pipeline_options.images_scale = 1.5  # Set image scale for better quality
         
+        # Use DocumentConverter with minimal configuration
         default_converter = DocumentConverter(format_options={
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
         })
         
         # Process based on file type
         if ext == ".pdf":
-            # Convert PDF using default pipeline
+            # Convert PDF using minimal pipeline
             conv_res = default_converter.convert(temp_path)
             doc = conv_res.document
             
-            # Detect image-only pages and replace using VLM if available
-            if vlm_converter:
-                vlm_processed_pages = 0
-                for page_no, page in doc.pages.items():
-                    # Check if page has no text but contains images
-                    page_has_text = hasattr(page, 'text') and page.text and page.text.strip()
-                    page_has_images = hasattr(page, 'image') and page.image and hasattr(page.image, 'pil_image')
-                    
-                    # Only process if page has no text but has a valid image
-                    if not page_has_text and page_has_images:
-                        st.info(f"Detected image-only page {page_no}, attempting VLM processing...")
-                        # For image-only pages, use VLM pipeline
-                        try:
-                            # Create a temporary image file for VLM processing
-                            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as img_temp:
-                                page.image.pil_image.save(img_temp, format="PNG")
-                                img_temp_path = img_temp.name
-                            
-                            try:
-                                # Check if the image file was created and has content
-                                if os.path.exists(img_temp_path) and os.path.getsize(img_temp_path) > 0:
-                                    img_conv_res = vlm_converter.convert(img_temp_path)
-                                    if img_conv_res and img_conv_res.document and img_conv_res.document.pages:
-                                        # Replace the page with VLM processed content
-                                        doc.pages[page_no] = img_conv_res.document.pages[0]
-                                        vlm_processed_pages += 1
-                                        st.info(f"Successfully processed page {page_no} with VLM")
-                                    else:
-                                        st.warning(f"VLM processing returned empty result for page {page_no}")
-                                else:
-                                    st.warning(f"Failed to create valid image file for page {page_no}")
-                            except Exception as e:
-                                st.warning(f"VLM processing failed for page {page_no}: {str(e)}")
-                            finally:
-                                try:
-                                    os.unlink(img_temp_path)
-                                except:
-                                    pass
-                        except Exception as e:
-                            st.warning(f"Failed to prepare image for VLM processing on page {page_no}: {str(e)}")
-                    elif not page_has_text and not page_has_images:
-                        st.info(f"Page {page_no} has no text and no images - skipping VLM processing")
-                    elif page_has_text:
-                        st.info(f"Page {page_no} has text content - skipping VLM processing")
-                
-                if vlm_processed_pages > 0:
-                    st.success(f"Successfully processed {vlm_processed_pages} image pages with VLM")
-                else:
-                    st.info("No pages were processed with VLM (this is normal if all pages have text content)")
+            # Debug: Check document structure
+            st.info(f"Document has {len(doc.pages)} pages, {len(doc.tables)} tables")
             
             # Extract content from processed document
             texts = []
             tables = []
             images = []
             
-            # Extract text from pages
-            for page_no, page in doc.pages.items():
-                if hasattr(page, 'text') and page.text and page.text.strip():
+            # Extract text from document elements (correct approach)
+            # Group text elements by page
+            page_texts = {}
+            for element, _level in doc.iterate_items():
+                if isinstance(element, (TextItem, SectionHeaderItem)) and hasattr(element, 'text') and element.text:
+                    page_no = getattr(element, 'page_no', 1)
+                    if page_no not in page_texts:
+                        page_texts[page_no] = []
+                    page_texts[page_no].append(element.text.strip())
+            
+            # Create text chunks for each page
+            for page_no, text_parts in page_texts.items():
+                if text_parts:
+                    combined_text = "\n".join(text_parts)
                     texts.append({
-                        'content': page.text.strip(),
+                        'content': combined_text,
                         'page_number': page_no
                     })
+                    st.info(f"✅ Extracted {len(combined_text)} characters from page {page_no}")
+                else:
+                    st.warning(f"⚠️ No text found on page {page_no}")
+            
+            # Fallback: If no text found via elements, try markdown export
+            if not texts:
+                st.info("🔄 No text found via elements, trying markdown export...")
+                try:
+                    md_content = doc.export_to_markdown()
+                    if md_content and md_content.strip():
+                        # Split markdown by headers to approximate pages
+                        sections = md_content.split('\n## ')
+                        for i, section in enumerate(sections):
+                            if section.strip():
+                                texts.append({
+                                    'content': section.strip(),
+                                    'page_number': i + 1
+                                })
+                        st.success(f"✅ Extracted {len(texts)} text sections via markdown export")
+                except Exception as e:
+                    st.error(f"❌ Markdown export failed: {e}")
+            
+            st.info(f"Total pages with text: {len(page_texts)} out of {len(doc.pages)}")
             
             # Extract tables from document
             for table_ix, table in enumerate(doc.tables):
@@ -315,6 +289,7 @@ def process_file_with_docling(uploaded_file, vlm_model_name="SmolDocling MLX"):
                                 'type': 'picture',
                                 'index': picture_counter
                             })
+                            st.info(f"✅ Extracted picture {picture_counter} from page {getattr(element, 'page_no', 1)}")
                     except Exception as e:
                         st.warning(f"Failed to process picture {picture_counter}: {e}")
             
@@ -339,8 +314,11 @@ def process_file_with_docling(uploaded_file, vlm_model_name="SmolDocling MLX"):
                                 'type': 'table',
                                 'index': table_img_counter
                             })
+                            st.info(f"✅ Extracted table image {table_img_counter} from page {getattr(element, 'page_no', 1)}")
                     except Exception as e:
                         st.warning(f"Failed to process table image {table_img_counter}: {e}")
+            
+            st.info(f"🖼️ Total images extracted: {len(images)}")
             
         elif ext in [".doc", ".docx", ".ppt", ".pptx"]:
             # For other document types, use default converter
@@ -352,13 +330,29 @@ def process_file_with_docling(uploaded_file, vlm_model_name="SmolDocling MLX"):
             tables = []
             images = []
             
-            # Extract text from pages
-            for page_no, page in doc.pages.items():
-                if hasattr(page, 'text') and page.text and page.text.strip():
+            # Extract text from document elements (correct approach)
+            # Group text elements by page
+            page_texts = {}
+            for element, _level in doc.iterate_items():
+                if isinstance(element, (TextItem, SectionHeaderItem)) and hasattr(element, 'text') and element.text:
+                    page_no = getattr(element, 'page_no', 1)
+                    if page_no not in page_texts:
+                        page_texts[page_no] = []
+                    page_texts[page_no].append(element.text.strip())
+            
+            # Create text chunks for each page
+            for page_no, text_parts in page_texts.items():
+                if text_parts:
+                    combined_text = "\n".join(text_parts)
                     texts.append({
-                        'content': page.text.strip(),
+                        'content': combined_text,
                         'page_number': page_no
                     })
+                    st.info(f"✅ Extracted {len(combined_text)} characters from page {page_no}")
+                else:
+                    st.warning(f"⚠️ No text found on page {page_no}")
+            
+            st.info(f"Total pages with text: {len(page_texts)} out of {len(doc.pages)}")
             
             # Extract tables
             for table_ix, table in enumerate(doc.tables):
@@ -525,23 +519,8 @@ with tab1:
         # Prompt user for data store name
         data_store_name = st.text_input("Enter a data store name")
         
-        # VLM Model Selection
-        st.subheader("VLM Model Configuration")
-        vlm_model_name = st.selectbox(
-            "Select VLM Model for Image Processing",
-            options=list(VLM_MODELS.keys()),
-            index=0,
-            help="Choose the VLM model to use for processing image-only pages. SmolDocling MLX is recommended for macOS with MPS acceleration."
-        )
-        
-        # Option to disable VLM processing if needed
-        disable_vlm = st.checkbox(
-            "Disable VLM Processing (use default pipeline only)",
-            help="Check this if you're experiencing issues with VLM processing"
-        )
-        
-        if disable_vlm:
-            vlm_model_name = "Default"
+        # VLM is disabled to avoid meta tensor errors
+        st.info("🚫 VLM processing is disabled to avoid model loading errors")
         
         uploaded_files = st.file_uploader(
             "Upload multiple documents (PDF/TXT/DOC/DOCX/PPT/PPTX)",
@@ -550,6 +529,9 @@ with tab1:
             key="file_uploader"
         )
         enable_section_mapping = st.checkbox("Enable Section Mapping (optional)")
+        
+        # Add info about docling configuration
+        st.info("📋 Using docling with minimal configuration to avoid meta tensor errors. Text, table, and image extraction enabled.")
 
     section_to_docs = {}
     doc_to_sections = {}
@@ -649,10 +631,18 @@ with tab1:
         success_files = []
         failed_files = []
         doc_chunks_map = {}  # Store chunks for each doc for display
+        
+        # Add timing information
+        start_time = time.time()
+        
         for idx, uploaded_file in enumerate(nonempty_files):
+            file_start_time = time.time()
             status_text.text(f"Processing file {idx + 1} of {total_files}: {uploaded_file.name}")
             try:
-                texts, tables, images = process_file_with_docling(uploaded_file, vlm_model_name)
+                texts, tables, images = process_file_with_docling(uploaded_file)
+                file_processing_time = time.time() - file_start_time
+                st.info(f"✅ {uploaded_file.name} processed in {file_processing_time:.2f}s")
+                
                 doc_chunks_map[uploaded_file.name] = {'texts': [], 'tables': [], 'images': []}
                 doc_sections = doc_to_sections.get(uploaded_file.name, ["Unmapped"])
                 # Process text chunks
@@ -731,7 +721,9 @@ with tab1:
             preview_progress.progress((idx + 1) / total_files, text=f"Finished extracting: {uploaded_file.name}")
             status_text.empty()
         preview_progress.empty()
+        total_time = time.time() - start_time
         st.success(f"Data store created: {data_store_name}")
+        st.info(f"⏱️ Total processing time: {total_time:.2f}s for {len(success_files)} files")
         st.info("Move to the next tab to generate the report.")
         # Show all chunks in collapsible sections (no nested expanders)
         for doc_name, chunk_dict in doc_chunks_map.items():
