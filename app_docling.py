@@ -25,10 +25,22 @@ os.environ['DOCLING_USE_CPU'] = '1'
 
 # Add docling imports for basic pipeline
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.pipeline_options import PdfPipelineOptions, VlmPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.pipeline.vlm_pipeline import VlmPipeline
 from docling_core.types.doc import PictureItem, TableItem, TextItem, SectionHeaderItem
 import base64
+
+# Add VLM model specs import
+try:
+    from docling.datamodel.pipeline_options import (
+        smoldocling_vlm_conversion_options,
+        smoldocling_vlm_mlx_conversion_options
+    )
+    VLM_AVAILABLE = True
+except ImportError:
+    VLM_AVAILABLE = False
+    print("Warning: VLM models not available")
 
 # Set wide layout
 st.set_page_config(layout="wide")
@@ -143,12 +155,13 @@ def bedrock_chat(prompt, model_id=None):
     result = json.loads(response['body'].read())
     return result['content'][0]['text']
 
-def process_file_with_docling(uploaded_file):
+def process_file_with_docling(uploaded_file, vlm_mode="Basic Pipeline"):
     """
-    Process uploaded file using docling with basic pipeline for text/tables.
+    Process uploaded file using docling with basic pipeline or VLM for text/tables/images.
     
     Args:
         uploaded_file: The uploaded file to process
+        vlm_mode: Processing mode ("Basic Pipeline", "SmolDocling VLM (Transformers)", "SmolDocling VLM (MLX)")
     """
     # Save uploaded file to temp
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as temp_file:
@@ -168,26 +181,55 @@ def process_file_with_docling(uploaded_file):
         
         ext = os.path.splitext(temp_path)[1].lower()
         
-        # Initialize converters with minimal configuration to avoid model loading
-        st.info("Using minimal pipeline configuration to avoid meta tensor errors")
-        
-        # Create minimal pipeline options to avoid model loading
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.force_backend_text = True  # Use PDF backend for text extraction
-        pipeline_options.do_ocr = False  # Disable OCR to avoid model loading
-        pipeline_options.do_table_structure = True  # Enable table detection
-        pipeline_options.do_picture_classification = False  # Disable to avoid model loading
-        pipeline_options.do_picture_description = False  # Disable to avoid model loading
-        pipeline_options.do_code_enrichment = False  # Disable to avoid model loading
-        pipeline_options.do_formula_enrichment = False  # Disable to avoid model loading
-        pipeline_options.generate_page_images = True  # Enable image generation for extraction
-        pipeline_options.generate_picture_images = True  # Enable picture image generation
-        pipeline_options.images_scale = 1.5  # Set image scale for better quality
-        
-        # Use DocumentConverter with minimal configuration
-        default_converter = DocumentConverter(format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-        })
+        # Initialize converters based on selected mode
+        if vlm_mode == "Basic Pipeline":
+            st.info("Using basic pipeline configuration")
+            
+            # Create basic pipeline options
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.force_backend_text = True  # Use PDF backend for text extraction
+            pipeline_options.do_ocr = False  # Disable OCR to avoid model loading
+            pipeline_options.do_table_structure = True  # Enable table detection
+            pipeline_options.do_picture_classification = False  # Disable to avoid model loading
+            pipeline_options.do_picture_description = False  # Disable to avoid model loading
+            pipeline_options.do_code_enrichment = False  # Disable to avoid model loading
+            pipeline_options.do_formula_enrichment = False  # Disable to avoid model loading
+            pipeline_options.generate_page_images = True  # Enable image generation for extraction
+            pipeline_options.generate_picture_images = True  # Enable picture image generation
+            pipeline_options.images_scale = 1.5  # Set image scale for better quality
+            
+            # Use DocumentConverter with basic configuration
+            default_converter = DocumentConverter(format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            })
+            
+        elif vlm_mode == "SmolDocling VLM (Default)":
+            st.info("Using SmolDocling VLM with default settings (transformers framework)")
+            
+            # Use VLM pipeline with default settings (transformers)
+            default_converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_cls=VlmPipeline,
+                    ),
+                }
+            )
+            
+        elif vlm_mode == "SmolDocling VLM (MLX)":
+            st.info("Using SmolDocling VLM with MLX framework for better performance")
+            
+            # Use VLM pipeline with MLX options for better performance
+            pipeline_options = VlmPipelineOptions(
+                vlm_options=smoldocling_vlm_mlx_conversion_options,
+            )
+            default_converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(
+                        pipeline_cls=VlmPipeline,
+                        pipeline_options=pipeline_options,
+                    ),
+                }
+            )
         
         # Process based on file type
         if ext == ".pdf":
@@ -519,8 +561,16 @@ with tab1:
         # Prompt user for data store name
         data_store_name = st.text_input("Enter a data store name")
         
-        # VLM is disabled to avoid meta tensor errors
-        st.info("🚫 VLM processing is disabled to avoid model loading errors")
+        # VLM model selection
+        if VLM_AVAILABLE:
+            vlm_mode = st.selectbox(
+                "Processing Pipeline",
+                ["Basic Pipeline", "SmolDocling VLM (Default)", "SmolDocling VLM (MLX)"],
+                help="Basic Pipeline: Fast text and table extraction. SmolDocling VLM: Advanced document understanding with vision-language models."
+            )
+        else:
+            vlm_mode = "Basic Pipeline"
+            st.info("⚠️ VLM models not available. Using basic pipeline only.")
         
         uploaded_files = st.file_uploader(
             "Upload multiple documents (PDF/TXT/DOC/DOCX/PPT/PPTX)",
@@ -530,8 +580,13 @@ with tab1:
         )
         enable_section_mapping = st.checkbox("Enable Section Mapping (optional)")
         
-        # Add info about docling configuration
-        st.info("📋 Using docling with minimal configuration to avoid meta tensor errors. Text, table, and image extraction enabled.")
+        # Add info about current configuration
+        if vlm_mode == "Basic Pipeline":
+            st.info("📋 Using basic pipeline: Fast text, table, and image extraction.")
+        elif vlm_mode == "SmolDocling VLM (Default)":
+            st.info("🚀 Using SmolDocling VLM (Default): Advanced document understanding with transformers framework.")
+        else:
+            st.info("🚀 Using SmolDocling VLM (MLX): Advanced document understanding with MLX framework for optimal performance.")
 
     section_to_docs = {}
     doc_to_sections = {}
@@ -639,7 +694,7 @@ with tab1:
             file_start_time = time.time()
             status_text.text(f"Processing file {idx + 1} of {total_files}: {uploaded_file.name}")
             try:
-                texts, tables, images = process_file_with_docling(uploaded_file)
+                texts, tables, images = process_file_with_docling(uploaded_file, vlm_mode)
                 file_processing_time = time.time() - file_start_time
                 st.info(f"✅ {uploaded_file.name} processed in {file_processing_time:.2f}s")
                 

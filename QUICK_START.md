@@ -2,7 +2,7 @@
 
 ## ✅ Meta Tensor Error Fixed!
 
-The meta tensor error has been resolved. The app now uses docling with minimal configuration to avoid PyTorch model loading issues.
+The meta tensor error has been resolved. The app now uses docling with two pipeline options to avoid PyTorch model loading issues.
 
 ## 🚀 How to Run the App
 
@@ -28,32 +28,42 @@ streamlit run app_docling.py --server.port 8501
 ## 🌐 Access the App
 Open your browser and go to: **http://localhost:8501**
 
-## 📋 What Works Now
-- ✅ Document upload (PDF, DOC, DOCX, PPT, PPTX, TXT)
-- ✅ Text extraction using docling
-- ✅ Table detection and extraction
-- ✅ ChromaDB vector storage
-- ✅ AWS Bedrock integration
-- ✅ Memo generation with semantic search
-- ✅ **No more meta tensor errors!**
+## 📋 Pipeline Options
+
+### 1. Basic Pipeline (Recommended)
+- ✅ **Fast processing**: Text, table, and image extraction
+- ✅ **No model loading**: Avoids meta tensor errors
+- ✅ **Reliable**: Works consistently across different documents
+- ✅ **Lightweight**: Minimal resource usage
+
+### 2. SmolDocling VLM (Default)
+- 🚀 **Advanced understanding**: Uses SmolDocling vision-language model
+- 🚀 **Transformers framework**: Standard PyTorch-based processing
+- 🚀 **Better comprehension**: Enhanced document understanding
+- ⚠️ **Slower processing**: More computational intensive
+
+### 3. SmolDocling VLM (MLX)
+- 🚀 **Advanced understanding**: Uses SmolDocling vision-language model
+- 🚀 **MLX framework**: Optimized for Apple Silicon Macs
+- 🚀 **Better performance**: Faster processing on M1/M2 Macs
+- ⚠️ **Apple Silicon only**: Requires M1/M2 Mac for optimal performance
 
 ## 🔧 Configuration
-The app uses minimal docling configuration:
-- Text extraction: ✅ Enabled (PDF backend)
-- Table detection: ✅ Enabled
-- OCR: ❌ Disabled (to avoid model loading)
-- Image processing: ❌ Disabled (to avoid model loading)
-- VLM processing: ❌ Disabled (to avoid model loading)
+The app automatically detects available capabilities:
+- **Basic Pipeline**: Always available
+- **SmolDocling VLM (Default)**: Available if SmolDocling models are installed
+- **SmolDocling VLM (MLX)**: Available if SmolDocling models and MLX are installed
 
 ## 🧪 Testing
-To verify the fix works:
+To verify both pipelines work:
 ```bash
 conda activate docling
-python test_docling_fixed.py
+python test_both_pipelines.py
 ```
 
 ## 📁 Key Files
-- `app_docling.py` - Main Streamlit application
+- `app_docling.py` - Main Streamlit application with dual pipeline support
 - `run_app.sh` - Easy startup script
-- `test_docling_fixed.py` - Test script to verify the fix
+- `test_both_pipelines.py` - Test script for both pipelines
+- `test_image_extraction.py` - Test script for image extraction
 - `META_TENSOR_FIX.md` - Detailed explanation of the fix 
