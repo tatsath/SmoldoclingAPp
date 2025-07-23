@@ -629,7 +629,8 @@ with tab2:
             selected_collection = st.selectbox(
                 "Select ChromaDB Collection", 
                 ["All Collections"] + available_collections,
-                help="Filter by specific ChromaDB collection"
+                help="Filter by specific ChromaDB collection",
+                key="qa_collection_filter"
             )
         else:
             selected_collection = "All Collections"
@@ -645,14 +646,14 @@ with tab2:
             all_quarters = ["All"] + list(set(data.get('metadata', {}).get('quarter', '') for data in st.session_state.multivector_data.values() if data.get('metadata', {}).get('quarter')))
             all_years = ["All"] + list(set(str(data.get('metadata', {}).get('year', '')) for data in st.session_state.multivector_data.values() if data.get('metadata', {}).get('year')))
             
-            selected_ticker = st.selectbox("Ticker Symbol", all_tickers, help="Filter by specific ticker")
-            selected_quarter = st.selectbox("Quarter", all_quarters, help="Filter by specific quarter")
-            selected_year = st.selectbox("Year", all_years, help="Filter by specific year")
+            selected_ticker = st.selectbox("Ticker Symbol", all_tickers, help="Filter by specific ticker", key="qa_ticker_filter")
+            selected_quarter = st.selectbox("Quarter", all_quarters, help="Filter by specific quarter", key="qa_quarter_filter")
+            selected_year = st.selectbox("Year", all_years, help="Filter by specific year", key="qa_year_filter")
         
         with col2:
             st.write("**🔧 Custom Metadata Filter:**")
-            custom_key = st.text_input("Metadata Key", placeholder="e.g., Company, Sector")
-            custom_value = st.text_input("Metadata Value", placeholder="Value to search for")
+            custom_key = st.text_input("Metadata Key", placeholder="e.g., Company, Sector", key="qa_custom_key")
+            custom_value = st.text_input("Metadata Value", placeholder="Value to search for", key="qa_custom_value")
         
         # Question input
         st.subheader("❓ Ask Your Question")
@@ -794,7 +795,8 @@ with tab3:
                 selected_collection = st.selectbox(
                     "Select ChromaDB Collection", 
                     ["All Collections"] + available_collections,
-                    help="Filter by specific ChromaDB collection"
+                    help="Filter by specific ChromaDB collection",
+                    key="search_collection_filter"
                 )
             else:
                 selected_collection = "All Collections"
@@ -805,24 +807,24 @@ with tab3:
             
             # Ticker filter
             tickers = list(set([m.get('ticker', '') for m in all_metadata if m.get('ticker')]))
-            selected_ticker = st.selectbox("Ticker Symbol", ["All"] + tickers)
+            selected_ticker = st.selectbox("Ticker Symbol", ["All"] + tickers, key="search_ticker_filter")
             
             # Quarter filter
             quarters = list(set([m.get('quarter', '') for m in all_metadata if m.get('quarter')]))
-            selected_quarter = st.selectbox("Quarter", ["All"] + quarters)
+            selected_quarter = st.selectbox("Quarter", ["All"] + quarters, key="search_quarter_filter")
             
             # Year filter
             years = list(set([m.get('year', '') for m in all_metadata if m.get('year')]))
-            selected_year = st.selectbox("Year", ["All"] + years)
+            selected_year = st.selectbox("Year", ["All"] + years, key="search_year_filter")
             
             # Content type filter
             content_types = ["All", "summary", "tables", "image_analysis", "full_text"]
-            selected_content_type = st.selectbox("Content Type", content_types)
+            selected_content_type = st.selectbox("Content Type", content_types, key="search_content_type_filter")
             
             # Custom metadata filter
             st.write("**Custom Metadata Filter:**")
-            custom_key = st.text_input("Metadata Key", placeholder="e.g., Company, Sector")
-            custom_value = st.text_input("Metadata Value", placeholder="Value to search for")
+            custom_key = st.text_input("Metadata Key", placeholder="e.g., Company, Sector", key="search_custom_key")
+            custom_value = st.text_input("Metadata Value", placeholder="Value to search for", key="search_custom_value")
         
         with col2:
             st.subheader("🔍 Search Options")
