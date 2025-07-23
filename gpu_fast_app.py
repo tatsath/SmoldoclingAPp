@@ -74,6 +74,26 @@ def initialize_chroma():
         st.error(f"Failed to initialize ChromaDB: {e}")
         return None, None
 
+def get_all_chroma_collections():
+    """Get all available ChromaDB collections"""
+    try:
+        chroma_client = chromadb.PersistentClient(path="./chroma_db")
+        collections = chroma_client.list_collections()
+        return [col.name for col in collections]
+    except Exception as e:
+        st.error(f"Failed to get ChromaDB collections: {e}")
+        return []
+
+def get_collection_by_name(collection_name):
+    """Get a specific ChromaDB collection by name"""
+    try:
+        chroma_client = chromadb.PersistentClient(path="./chroma_db")
+        collection = chroma_client.get_collection(collection_name)
+        return collection
+    except Exception as e:
+        st.error(f"Failed to get collection '{collection_name}': {e}")
+        return None
+
 def initialize_multivector_retriever():
     """Initialize MultiVectorRetriever with LangChain components"""
     try:
@@ -518,6 +538,10 @@ with tab1:
                     
                     st.success(f"🎉 Document processed successfully! {len(results)} pages analyzed and stored in ChromaDB.")
                     
+                    # Show collection information
+                    st.info(f"📦 **Documents stored in ChromaDB Collection:** `{st.session_state.collection.name}`")
+                    st.info(f"🔗 **MultiVectorRetriever Collection:** `multivector_documents`")
+                    
                     # Display results
                     st.header("📊 Analysis Results")
                     
@@ -573,7 +597,7 @@ with tab1:
 with tab2:
     st.header("❓ Ask Questions About Your Documents")
     
-    if st.session_state.collection is None:
+    if st.session_state.multivector_retriever is None:
         st.info("📄 Please process a PDF document first to enable Q&A functionality.")
         # Load existing multivector data
         if not st.session_state.multivector_data:
@@ -584,53 +608,109 @@ with tab2:
                 filename = pickle_file.replace('multivector_data_', '').replace('.pkl', '')
                 loaded_data = load_multivector_data(filename)
                 st.session_state.multivector_data.update(loaded_data)
+    else:
+        # Load existing data if not already loaded
+        if not st.session_state.multivector_data:
+            st.info("🔄 Loading existing document data...")
+            # Try to load from pickle files
+            pickle_files = [f for f in os.listdir('.') if f.startswith('multivector_data_') and f.endswith('.pkl')]
+            for pickle_file in pickle_files:
+                filename = pickle_file.replace('multivector_data_', '').replace('.pkl', '')
+                loaded_data = load_multivector_data(filename)
+                st.session_state.multivector_data.update(loaded_data)
+        
+        # Metadata filtering section
+        st.subheader("🔍 Filter by Metadata (Optional)")
+        
+        # Collection filter
+        st.write("**📦 ChromaDB Collection Filter:**")
+        available_collections = get_all_chroma_collections()
+        if available_collections:
+            selected_collection = st.selectbox(
+                "Select ChromaDB Collection", 
+                ["All Collections"] + available_collections,
+                help="Filter by specific ChromaDB collection"
+            )
+        else:
+            selected_collection = "All Collections"
+            st.info("No ChromaDB collections found")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**📊 Document Filters:**")
+            
+            # Get unique values for filters
+            all_tickers = ["All"] + list(set(data.get('metadata', {}).get('ticker', '') for data in st.session_state.multivector_data.values() if data.get('metadata', {}).get('ticker')))
+            all_quarters = ["All"] + list(set(data.get('metadata', {}).get('quarter', '') for data in st.session_state.multivector_data.values() if data.get('metadata', {}).get('quarter')))
+            all_years = ["All"] + list(set(str(data.get('metadata', {}).get('year', '')) for data in st.session_state.multivector_data.values() if data.get('metadata', {}).get('year')))
+            
+            selected_ticker = st.selectbox("Ticker Symbol", all_tickers, help="Filter by specific ticker")
+            selected_quarter = st.selectbox("Quarter", all_quarters, help="Filter by specific quarter")
+            selected_year = st.selectbox("Year", all_years, help="Filter by specific year")
+        
+        with col2:
+            st.write("**🔧 Custom Metadata Filter:**")
+            custom_key = st.text_input("Metadata Key", placeholder="e.g., Company, Sector")
+            custom_value = st.text_input("Metadata Value", placeholder="Value to search for")
         
         # Question input
+        st.subheader("❓ Ask Your Question")
         question = st.text_input(
-            "Ask a question about your document:",
+            "Ask a question about your filtered documents:",
             placeholder="e.g., What tables are in the document? What are the key findings?",
-            help="Ask questions about the processed document"
+            help="Ask questions about the processed documents (filtered by metadata if specified)"
         )
         
+        # Number of results
+        num_results = st.slider("Number of Results", 1, 20, 5, help="Number of relevant document chunks to retrieve")
+        
         if question:
-            if st.button("🔍 Search", type="primary"):
+            if st.button("🔍 Search & Answer", type="primary", use_container_width=True):
                 try:
-                    # Search in ChromaDB
-                    results = st.session_state.collection.query(
-                        query_texts=[question],
-                        n_results=5
-                    )
+                    # Filter documents by metadata
+                    filtered_data = {}
+                    for doc_key, data in st.session_state.multivector_data.items():
+                        metadata = data.get('metadata', {})
+                        
+                        # Apply filters
+                        if selected_ticker != "All" and metadata.get('ticker') != selected_ticker:
+                            continue
+                        if selected_quarter != "All" and metadata.get('quarter') != selected_quarter:
+                            continue
+                        if selected_year != "All" and str(metadata.get('year', '')) != selected_year:
+                            continue
+                        if custom_key and custom_value and metadata.get(custom_key) != custom_value:
+                            continue
+                        
+                        filtered_data[doc_key] = data
                     
-                    if results and 'documents' in results and results['documents'][0]:
-                        st.subheader("🔍 Search Results")
-                        
-                        # Collect all relevant content for answer generation using multivector data
-                        all_content = []
-                        multivector_content = []
-                        
-                        for i, (doc, metadata) in enumerate(zip(
-                            results['documents'][0],
-                            results['metadatas'][0]
-                        )):
-                            doc_id = results['ids'][0][i]
-                            
-                            # Get multivector data
-                            multivector_entry = st.session_state.multivector_data.get(doc_id, {})
-                            if multivector_entry:
-                                multivector_content.append({
-                                    "page_number": metadata['page_number'],
-                                    "text_content": multivector_entry.get("text_content", ""),
-                                    "overall_summary": multivector_entry.get("overall_summary", ""),
-                                    "table_summaries": multivector_entry.get("table_summaries", []),
-                                    "image_analysis": multivector_entry.get("image_analysis", ""),
-                                    "metadata": metadata
-                                })
-                            
-                            all_content.append(f"Page {metadata['page_number'] + 1}: {doc}")
-                        
-                        # Generate a direct answer using Bedrock with multivector data
-                        combined_content = "\n\n".join(all_content)
-                        answer_prompt = f"""Based on the following document content, provide a direct and specific answer to this question: "{question}"
+                    if filtered_data:
+                        # Use MultiVectorRetriever for search
+                        if st.session_state.multivector_retriever:
+                            with st.spinner("Searching and generating answer..."):
+                                # Get relevant documents using MultiVectorRetriever
+                                results = st.session_state.multivector_retriever.get_relevant_documents(
+                                    question,
+                                    k=num_results
+                                )
+                                
+                                if results:
+                                    st.subheader("🔍 Search Results")
+                                    
+                                    # Display individual results
+                                    for i, doc in enumerate(results):
+                                        with st.expander(f"Result {i+1}", expanded=i < 2):
+                                            st.write("**Content:**")
+                                            st.write(doc.page_content)
+                                            
+                                            st.write("**Metadata:**")
+                                            for key, value in doc.metadata.items():
+                                                st.write(f"- {key}: {value}")
+                                    
+                                    # Generate answer using Bedrock
+                                    combined_content = "\n\n".join([doc.page_content for doc in results])
+                                    answer_prompt = f"""Based on the following filtered document content, provide a direct and specific answer to this question: "{question}"
 
 Document Content:
 {combined_content}
@@ -638,117 +718,53 @@ Document Content:
 Please provide:
 1. A direct answer to the question
 2. Specific data points or facts that support your answer
-3. The page numbers where this information was found
+3. The metadata information where this data was found (ticker, quarter, year, etc.)
 
 Answer:"""
-                        
-                        # Get answer from Bedrock
-                        with st.spinner("Generating answer..."):
-                            bedrock_client = initialize_bedrock(aws_region, model_id)
-                            if bedrock_client:
-                                direct_answer = analyze_with_bedrock(bedrock_client, model_id, answer_prompt)
-                                
-                                # Display the direct answer
-                                st.subheader("💡 Direct Answer")
-                                st.write(direct_answer)
-                        
-                        # Show the source context with enhanced metadata
-                        st.subheader("📄 Source Context")
-                        for i, (doc, metadata) in enumerate(zip(
-                            results['documents'][0],
-                            results['metadatas'][0]
-                        )):
-                            with st.expander(f"Page {metadata['page_number'] + 1} - {metadata['filename']}", expanded=i < 2):
-                                st.write("**Content:**")
-                                st.write(doc)
-                                
-                                st.write("**Metadata:**")
-                                st.write(f"- Text words: {metadata['text_word_count']}")
-                                st.write(f"- Tables: {metadata['table_count']}")
-                                
-                                # Show enhanced metadata
-                                if metadata.get('ticker'):
-                                    st.write(f"- Ticker: {metadata['ticker']}")
-                                if metadata.get('quarter') and metadata.get('year'):
-                                    st.write(f"- Period: {metadata['quarter']} {metadata['year']}")
-                                
-                                # Show custom metadata
-                                custom_fields = {k: v for k, v in metadata.items() 
-                                               if k not in ['page_number', 'text_word_count', 'table_count', 
-                                                           'filename', 'ticker', 'quarter', 'year']}
-                                if custom_fields:
-                                    st.write("**Custom Metadata:**")
-                                    for key, value in custom_fields.items():
-                                        st.write(f"- {key}: {value}")
-                                
-                                # Show multivector data if available
-                                doc_id = results['ids'][0][i]
-                                multivector_entry = st.session_state.multivector_data.get(doc_id, {})
-                                if multivector_entry:
-                                    if multivector_entry.get("table_summaries"):
-                                        st.write("**Table Summaries:**")
-                                        for j, summary in enumerate(multivector_entry["table_summaries"]):
-                                            st.write(f"- Table {j+1}: {summary}")
                                     
-                                    if multivector_entry.get("image_analysis"):
-                                        st.write("**Image Analysis:**")
-                                        st.write(multivector_entry["image_analysis"])
+                                    with st.spinner("Generating answer..."):
+                                        bedrock_client = initialize_bedrock(aws_region, model_id)
+                                        if bedrock_client:
+                                            direct_answer = analyze_with_bedrock(bedrock_client, model_id, answer_prompt)
+                                            
+                                            st.subheader("💡 Direct Answer")
+                                            st.write(direct_answer)
+                                    
+                                    # Show detailed source context
+                                    st.subheader("📄 Source Context")
+                                    for i, doc in enumerate(results):
+                                        with st.expander(f"Source {i+1} - {doc.metadata.get('content_type', 'Unknown')}", expanded=i < 2):
+                                            st.write("**Content:**")
+                                            st.write(doc.page_content)
+                                            
+                                            st.write("**Metadata:**")
+                                            for key, value in doc.metadata.items():
+                                                st.write(f"- {key}: {value}")
+                                            
+                                            # Show additional context from multivector data
+                                            doc_id = doc.metadata.get('doc_id')
+                                            if doc_id:
+                                                for mv_key, mv_data in st.session_state.multivector_data.items():
+                                                    if mv_data.get('doc_id') == doc_id:
+                                                        if mv_data.get("table_summaries"):
+                                                            st.write("**Table Summaries:**")
+                                                            for j, summary in enumerate(mv_data["table_summaries"]):
+                                                                st.write(f"- Table {j+1}: {summary}")
+                                                        
+                                                        if mv_data.get("image_analysis"):
+                                                            st.write("**Image Analysis:**")
+                                                            st.write(mv_data["image_analysis"])
+                                                        break
+                                else:
+                                    st.info("No relevant results found for the given question and filters. Try rephrasing your question or adjusting the filters.")
+                        else:
+                            st.error("MultiVectorRetriever not available")
                     else:
-                        st.info("No relevant results found. Try rephrasing your question.")
+                        st.warning("No documents match the selected filters. Please adjust your filter criteria.")
                 
                 except Exception as e:
                     st.error(f"Search failed: {e}")
-        
-        # Show available metadata
-        if st.session_state.multivector_data:
-            st.subheader("📋 Available Documents")
-            unique_files = set()
-            for doc_id, data in st.session_state.multivector_data.items():
-                filename = data.get('metadata', {}).get('filename', 'Unknown')
-                unique_files.add(filename)
-            
-            for filename in unique_files:
-                with st.expander(f"📄 {filename}", expanded=False):
-                    file_data = [data for data in st.session_state.multivector_data.values() 
-                               if data.get('metadata', {}).get('filename') == filename]
-                    
-                    if file_data:
-                        metadata = file_data[0]['metadata']
-                        st.write("**Metadata:**")
-                        if metadata.get('ticker'):
-                            st.write(f"- Ticker: {metadata['ticker']}")
-                        if metadata.get('quarter') and metadata.get('year'):
-                            st.write(f"- Period: {metadata['quarter']} {metadata['year']}")
-                        
-                        # Show custom metadata
-                        custom_fields = {k: v for k, v in metadata.items() 
-                                       if k not in ['page_number', 'text_word_count', 'table_count', 
-                                                   'filename', 'ticker', 'quarter', 'year']}
-                        if custom_fields:
-                            st.write("**Custom Metadata:**")
-                            for key, value in custom_fields.items():
-                                st.write(f"- {key}: {value}")
-                        
-                        st.write(f"- Pages: {len(file_data)}")
-                        total_words = sum(data.get('metadata', {}).get('text_word_count', 0) for data in file_data)
-                        total_tables = sum(data.get('metadata', {}).get('table_count', 0) for data in file_data)
-                        st.write(f"- Total Words: {total_words}")
-                        st.write(f"- Total Tables: {total_tables}")
-        
-        # Example questions
-        st.subheader("💡 Example Questions")
-        example_questions = [
-            "What tables are in the document?",
-            "What are the key findings?",
-            "What financial data is mentioned?",
-            "What images or charts are described?",
-            "What are the main topics covered?"
-        ]
-        
-        for q in example_questions:
-            if st.button(q, key=f"example_{q}"):
-                st.session_state.question = q
-                st.rerun()
+                    st.exception(e)
 
 with tab3:
     st.header("🔍 Search by Metadata")
@@ -770,6 +786,19 @@ with tab3:
         
         with col1:
             st.subheader("📋 Filter by Metadata")
+            
+            # Collection filter
+            st.write("**📦 ChromaDB Collection Filter:**")
+            available_collections = get_all_chroma_collections()
+            if available_collections:
+                selected_collection = st.selectbox(
+                    "Select ChromaDB Collection", 
+                    ["All Collections"] + available_collections,
+                    help="Filter by specific ChromaDB collection"
+                )
+            else:
+                selected_collection = "All Collections"
+                st.info("No ChromaDB collections found")
             
             # Get unique values for filters
             all_metadata = [data.get('metadata', {}) for data in st.session_state.multivector_data.values()]
